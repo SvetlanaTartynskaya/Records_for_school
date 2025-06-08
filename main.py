@@ -22,54 +22,12 @@ logger = logging.getLogger(__name__)
 
 # Состояния для ConversationHandler
 ENTER_TAB_NUMBER, ENTER_READINGS, SELECT_EQUIPMENT, ENTER_VALUE, CONFIRM_READINGS = range(5)
-CONTACT_MESSAGE = 7  # Новое состояние для ввода сообщения
 
 # Инициализация обработчика табеля
 shifts_handler = ShiftsHandler()
 
 conn = sqlite3.connect('Users_bot.db', check_same_thread=False)
 cursor = conn.cursor()
-
-# Создание таблиц, если они не существуют
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS Users_admin_bot (
-    tab_number INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    role TEXT DEFAULT 'Администратор',
-    chat_id INTEGER NOT NULL,
-    location TEXT,
-    division TEXT
-)''')
-
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS Users_user_bot (
-    tab_number INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    role TEXT DEFAULT 'Пользователь',
-    chat_id INTEGER NOT NULL,
-    location TEXT,
-    division TEXT
-)''')
-
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS Users_dir_bot (
-    tab_number INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    role TEXT DEFAULT 'Руководитель',
-    chat_id INTEGER NOT NULL,
-    location TEXT,
-    division TEXT
-)''')
-
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS shifts (
-    tab_number INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    is_on_shift TEXT DEFAULT 'НЕТ',
-    FOREIGN KEY (tab_number) REFERENCES Users_user_bot(tab_number)
-)''')
-
-conn.commit()
 
 # Загрузка таблицы пользователей
 def load_users_table():
@@ -93,14 +51,6 @@ def load_shifts_table():
 def start(update: Update, context: CallbackContext) -> int:
     if 'started' in context.user_data:
         return ENTER_TAB_NUMBER
-        
-    user_id = update.effective_user.id
-    logger.info(f"Получена команда /start от пользователя {user_id}")
-    
-    # Очищаем данные пользователя при новом старте
-    context.user_data.clear()
-    context.user_data['started'] = True  # Отмечаем, что приветствие было
-    logger.info("Очищены предыдущие данные пользователя")
 
     try:
         user_id = update.effective_user.id
@@ -309,13 +259,11 @@ def show_role_specific_menu(update: Update, role: str):
     if role == 'Администратор':
         keyboard = [
             ['Посмотреть показания за эту неделю'],
-            ['Связаться с оператором'],
             ['В начало']
         ]
     elif role == 'Руководитель':
         keyboard = [
-            ['Загрузить показания', 'Мой профиль'],
-            ['Связаться с администратором'],
+            ['Загрузить показания'],
             ['В начало']
         ]
     else:  # Оператор
@@ -337,8 +285,6 @@ def handle_button(update: Update, context: CallbackContext):
     text = update.message.text
     if text == 'В начало':
         return return_to_start(update, context)
-    elif text == 'Связаться с оператором':
-        return start_contact_operator(update, context)
 
 # Удаление пользователя из базы данных
 def delete_user(tab_number, role):
@@ -1074,325 +1020,6 @@ def handle_view_readings(update: Update, context: CallbackContext):
         caption=f"Показания за неделю {current_week} (локация: {location}, подразделение: {division})"
     )
 
-# Обработчик для кнопки "Связаться с оператором"
-def handle_contact_operator(update: Update, context: CallbackContext):
-    if not check_access(update, context):
-        return
-    
-    tab_number = context.user_data.get('tab_number')
-    name = context.user_data.get('name')
-    role = context.user_data.get('role')
-    
-    # Получаем список операторов
-    cursor.execute('''
-        SELECT u.tab_number, u.name, u.location, u.division 
-        FROM Users_user_bot u
-        JOIN shifts s ON u.tab_number = s.tab_number
-        WHERE s.is_on_shift = "ДА"
-    ''')
-    operators = cursor.fetchall()
-    
-    if not operators:
-        update.message.reply_text("В данный момент нет доступных операторов на смене.")
-        return
-    
-    # Группируем операторов по локации и подразделению
-    operators_by_location = {}
-    for op_tab, op_name, op_location, op_division in operators:
-        if op_location not in operators_by_location:
-            operators_by_location[op_location] = {}
-        
-        if op_division not in operators_by_location[op_location]:
-            operators_by_location[op_location][op_division] = []
-        
-        operators_by_location[op_location][op_division].append((op_tab, op_name))
-    
-    # Создаем клавиатуру для выбора локации
-    keyboard = []
-    for location in operators_by_location.keys():
-        keyboard.append([InlineKeyboardButton(location, callback_data=f"select_location_{location}")])
-    
-    # Добавляем кнопку отмены
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Сохраняем данные операторов для использования в следующих шагах
-    context.user_data['operators_by_location'] = operators_by_location
-    
-    update.message.reply_text(
-        "Выберите локацию оператора для связи:",
-        reply_markup=reply_markup
-    )
-
-# Обработчик для выбора локации оператора
-def handle_select_location(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    # Получаем выбранную локацию
-    location = query.data.replace("select_location_", "")
-    
-    # Получаем подразделения для выбранной локации
-    operators_by_location = context.user_data.get('operators_by_location', {})
-    divisions = operators_by_location.get(location, {})
-    
-    if not divisions:
-        query.edit_message_text("Для выбранной локации нет доступных операторов.")
-        return
-    
-    # Создаем клавиатуру для выбора подразделения
-    keyboard = []
-    for division in divisions.keys():
-        keyboard.append([InlineKeyboardButton(division, callback_data=f"select_division_{location}_{division}")])
-    
-    # Добавляем кнопку отмены
-    keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_locations")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        f"Выберите подразделение для локации {location}:",
-        reply_markup=reply_markup
-    )
-
-# Обработчик для выбора подразделения оператора
-def handle_select_division(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    # Получаем выбранную локацию и подразделение
-    data_parts = query.data.replace("select_division_", "").split("_")
-    location = data_parts[0]
-    division = "_".join(data_parts[1:])  # На случай, если в названии подразделения есть символ _
-    
-    # Получаем операторов для выбранной локации и подразделения
-    operators_by_location = context.user_data.get('operators_by_location', {})
-    operators = operators_by_location.get(location, {}).get(division, [])
-    
-    if not operators:
-        query.edit_message_text("Для выбранного подразделения нет доступных операторов.")
-        return
-    
-    # Создаем клавиатуру для выбора оператора
-    keyboard = []
-    for op_tab, op_name in operators:
-        keyboard.append([InlineKeyboardButton(op_name, callback_data=f"contact_operator_{op_tab}")])
-    
-    # Добавляем кнопку отмены
-    keyboard.append([InlineKeyboardButton("Назад", callback_data=f"select_location_{location}")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        f"Выберите оператора для связи (локация: {location}, подразделение: {division}):",
-        reply_markup=reply_markup
-    )
-
-# Обработчик для выбора локации руководителя
-def handle_select_mgr_location(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    # Получаем выбранную локацию
-    location = query.data.replace("select_mgr_location_", "")
-    
-    # Получаем подразделения для выбранной локации
-    managers_by_location = context.user_data.get('managers_by_location', {})
-    divisions = managers_by_location.get(location, {})
-    
-    if not divisions:
-        query.edit_message_text("Для выбранной локации нет доступных руководителей.")
-        return
-    
-    # Создаем клавиатуру для выбора подразделения
-    keyboard = []
-    for division in divisions.keys():
-        # Ensure division name is safe for callback_data by replacing spaces with underscores
-        safe_division = division.replace(" ", "_")
-        callback_data = f"select_mgr_division_{location}_{safe_division}"
-        
-        # Ensure callback_data doesn't exceed 64 bytes
-        if len(callback_data.encode('utf-8')) > 64:
-            # If too long, use a hash or shorter identifier
-            callback_data = f"div_{hash(safe_division)}"
-            
-        keyboard.append([InlineKeyboardButton(division, callback_data=callback_data)])
-    
-    # Добавляем кнопку отмены
-    keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_mgr_locations")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        f"Выберите подразделение для локации {location}:",
-        reply_markup=reply_markup
-    )
-
-# Обработчик для отправки сообщения оператору
-def handle_contact_operator_selected(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    # Получаем ID выбранного оператора
-    operator_tab = query.data.replace("contact_operator_", "")
-    
-    # Получаем информацию об операторе
-    cursor.execute('SELECT name, chat_id FROM Users_user_bot WHERE tab_number = ?', (operator_tab,))
-    operator_info = cursor.fetchone()
-    
-    if not operator_info:
-        query.edit_message_text("Ошибка: оператор не найден.")
-        return ConversationHandler.END
-    
-    operator_name, operator_chat_id = operator_info
-    
-    # Сохраняем данные оператора для последующей отправки сообщения
-    context.user_data['contact_operator_name'] = operator_name
-    context.user_data['contact_operator_chat_id'] = operator_chat_id
-    
-    query.edit_message_text(
-        f"Вы выбрали оператора: {operator_name}\n\n"
-        f"Введите ваше сообщение для отправки. Для отмены введите /cancel"
-    )
-    
-    return CONTACT_MESSAGE
-
-# Обработчик для отмены выбора контакта
-def handle_cancel_contact(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    query.edit_message_text("Операция отменена.")
-    
-    # Очищаем данные контакта
-    for key in ['contact_admin_tab', 'contact_admin_name', 'contact_operator_tab', 
-               'contact_operator_name', 'contact_manager_tab', 'contact_manager_name',
-               'waiting_for_message_to_admin', 'waiting_for_message_to_operator',
-               'waiting_for_message_to_manager', 'operators_by_location', 'managers_by_location']:
-        if key in context.user_data:
-            del context.user_data[key]
-
-# Обработчик для возврата к выбору локации
-def handle_back_to_locations(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    # Получаем данные операторов
-    operators_by_location = context.user_data.get('operators_by_location', {})
-    
-    # Создаем клавиатуру для выбора локации
-    keyboard = []
-    for location in operators_by_location.keys():
-        keyboard.append([InlineKeyboardButton(location, callback_data=f"select_location_{location}")])
-    
-    # Добавляем кнопку отмены
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        "Выберите локацию оператора для связи:",
-        reply_markup=reply_markup
-    )
-
-# Обработчик для возврата к выбору локации руководителя
-def handle_back_to_mgr_locations(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    # Получаем данные руководителей
-    managers_by_location = context.user_data.get('managers_by_location', {})
-    
-    # Создаем клавиатуру для выбора локации
-    keyboard = []
-    for location in managers_by_location.keys():
-        keyboard.append([InlineKeyboardButton(location, callback_data=f"select_mgr_location_{location}")])
-    
-    # Добавляем кнопку отмены
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    query.edit_message_text(
-        "Выберите локацию руководителя для связи:",
-        reply_markup=reply_markup
-    )
-
-# Обработчик для отправки сообщения
-def handle_message_input(update: Update, context: CallbackContext):
-    # Skip if we're in a conversation state
-    if context.user_data.get('state') == ENTER_TAB_NUMBER:
-        return
-        
-    # Проверяем, ожидается ли ввод сообщения
-    if not any([context.user_data.get('waiting_for_message_to_admin'),
-                context.user_data.get('waiting_for_message_to_operator'),
-                context.user_data.get('waiting_for_message_to_manager')]):
-        return
-    
-    # Получаем введенное сообщение
-    message_text = update.message.text
-    
-    # Получаем информацию о пользователе
-    tab_number = context.user_data.get('tab_number')
-    name = context.user_data.get('name')
-    role = context.user_data.get('role')
-    location = context.user_data.get('location')
-    division = context.user_data.get('division')
-    
-    # Определяем получателя сообщения
-    recipient_tab = None
-    recipient_name = None
-    recipient_role = None
-    
-    if context.user_data.get('waiting_for_message_to_admin'):
-        recipient_tab = context.user_data.get('contact_admin_tab')
-        recipient_name = context.user_data.get('contact_admin_name')
-        recipient_role = "Администратор"
-    elif context.user_data.get('waiting_for_message_to_operator'):
-        recipient_tab = context.user_data.get('contact_operator_tab')
-        recipient_name = context.user_data.get('contact_operator_name')
-        recipient_role = "Оператор"
-    
-    # Отправляем сообщение получателю
-    try:
-        # Формируем сообщение для получателя
-        recipient_message = f"📨 *Новое сообщение*\n\n" \
-                          f"От: {name} ({role})\n" \
-                          f"Локация: {location}\n" \
-                          f"Подразделение: {division}\n\n" \
-                          f"Сообщение:\n{message_text}\n\n" \
-                          f"Для ответа используйте кнопку 'Связаться с {role.lower()}' в вашем меню."
-        
-        # Отправляем сообщение получателю
-        context.bot.send_message(
-            chat_id=recipient_tab,
-            text=recipient_message,
-            parse_mode='Markdown'
-        )
-        
-        # Отправляем подтверждение отправителю
-        update.message.reply_text(
-            f"✅ Ваше сообщение успешно отправлено {recipient_role.lower()}у {recipient_name}."
-        )
-        
-        # Очищаем данные контакта
-        for key in ['contact_admin_tab', 'contact_admin_name', 'contact_operator_tab', 
-                   'contact_operator_name', 'contact_manager_tab', 'contact_manager_name',
-                   'waiting_for_message_to_admin', 'waiting_for_message_to_operator',
-                   'waiting_for_message_to_manager', 'operators_by_location', 'managers_by_location']:
-            if key in context.user_data:
-                del context.user_data[key]
-                
-    except Exception as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
-        update.message.reply_text(
-            f"❌ Произошла ошибка при отправке сообщения. Пожалуйста, попробуйте позже."
-        )
 
 def get_available_users_by_role(role):
     """Получает список доступных пользователей по роли"""
@@ -1406,125 +1033,128 @@ def get_available_users_by_role(role):
             cursor.execute('SELECT name, chat_id FROM Users_user_bot')
         return cursor.fetchall()
 
-def create_user_selection_keyboard(users):
-    """Создает клавиатуру с списком пользователей"""
-    keyboard = []
-    for name, _ in users:
-        keyboard.append([InlineKeyboardButton(name, callback_data=f"user_{name}")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel_contact")])
-    return InlineKeyboardMarkup(keyboard)
+def setup_ubylo_handlers(dp):
+    """Настройка обработчиков для статуса 'Убыло'"""
+    dp.add_handler(CallbackQueryHandler(
+        handle_ubylo_confirmation,
+        pattern='^confirm_ubylo_'
+    ))
+    dp.add_handler(CallbackQueryHandler(
+        handle_ubylo_rejection,
+        pattern='^reject_ubylo_'
+    ))
 
-def start_contact_operator(update: Update, context: CallbackContext):
-    """Начинает процесс связи с оператором"""
-    if not check_access(update, context):
-        return ConversationHandler.END
-    
-    operators = get_available_users_by_role('Пользователь')
-    if not operators:
-        update.message.reply_text("К сожалению, сейчас нет доступных операторов.")
-        return ConversationHandler.END
-    
-    context.user_data['contact_type'] = 'operator'
-    keyboard = create_user_selection_keyboard(operators)
-    update.message.reply_text("Выберите оператора для связи:", reply_markup=keyboard)
-    return CONTACT_MESSAGE
-
-def handle_user_selection(update: Update, context: CallbackContext):
-    """Обрабатывает выбор пользователя для связи"""
+def handle_ubylo_confirmation(update: Update, context: CallbackContext):
+    """Обработка подтверждения статуса 'Убыло' администратором"""
     query = update.callback_query
     query.answer()
     
-    if query.data == "cancel_contact":
-        query.edit_message_text("Отправка сообщения отменена.")
-        return ConversationHandler.END
-    
-    selected_user = query.data.replace("user_", "")
-    context.user_data['selected_user'] = selected_user
-    
-    query.edit_message_text(
-        f"Вы выбрали пользователя: {selected_user}\n"
-        "Пожалуйста, введите ваше сообщение:"
-    )
-    return CONTACT_MESSAGE
-
-def handle_contact_message(update: Update, context: CallbackContext):
-    """Обрабатывает введенное сообщение и отправляет его выбранному пользователю"""
-    message_text = update.message.text
-    selected_user = context.user_data.get('selected_user')
-    contact_type = context.user_data.get('contact_type')
-    
-    if not selected_user or not contact_type:
-        update.message.reply_text("Произошла ошибка. Пожалуйста, попробуйте снова.")
-        return ConversationHandler.END
-    
-    # Получаем информацию об отправителе
-    sender_tab_number = context.user_data.get('tab_number')
-    cursor.execute('''
-        SELECT name, role, location, division FROM (
-            SELECT name, role, location, division FROM Users_admin_bot WHERE tab_number = ?
-            UNION ALL
-            SELECT name, role, location, division FROM Users_dir_bot WHERE tab_number = ?
-            UNION ALL
-            SELECT name, role, location, division FROM Users_user_bot WHERE tab_number = ?
-        )
-    ''', (sender_tab_number, sender_tab_number, sender_tab_number))
-    sender_info = cursor.fetchone()
-    
-    if not sender_info:
-        update.message.reply_text("Ошибка: не удалось найти информацию о вас.")
-        return ConversationHandler.END
-    
-    sender_name, sender_role, sender_location, sender_division = sender_info
-    
-    # Получаем chat_id получателя
-    if contact_type == 'admin':
-        cursor.execute('SELECT chat_id FROM Users_admin_bot WHERE name = ?', (selected_user,))
-    elif contact_type == 'operator':
-        cursor.execute('SELECT chat_id FROM Users_user_bot WHERE name = ?', (selected_user,))
-    else:  # manager
-        cursor.execute('SELECT chat_id FROM Users_dir_bot WHERE name = ?', (selected_user,))
-    
-    recipient = cursor.fetchone()
-    if not recipient:
-        update.message.reply_text("Ошибка: не удалось найти получателя.")
-        return ConversationHandler.END
-    
-    recipient_chat_id = recipient[0]
-    
-    # Формируем и отправляем сообщение
-    formatted_message = (
-        f"📨 Новое сообщение\n"
-        f"От: {sender_name} ({sender_role})\n"
-        f"Локация: {sender_location}\n"
-        f"Подразделение: {sender_division}\n"
-        f"------------------\n"
-        f"{message_text}\n"
-        f"------------------\n"
-        f"Для ответа используйте кнопку 'Связаться с {sender_role.lower()}'"
-    )
+    request_id = query.data.replace('confirm_ubylo_', '')
     
     try:
+        # Получаем информацию о запросе
+        cursor.execute('''
+            SELECT inv_num, meter_type, user_tab, user_name, location, division
+            FROM pending_requests
+            WHERE request_id = ?
+        ''', (request_id,))
+        request_info = cursor.fetchone()
+        
+        if not request_info:
+            query.edit_message_text("Ошибка: запрос не найден")
+            return
+            
+        inv_num, meter_type, user_tab, user_name, location, division = request_info
+        
+        # Обновляем статус оборудования в базе
+        cursor.execute('''
+            UPDATE equipment
+            SET status = 'ubylo', current_location = NULL
+            WHERE inventory_number = ? AND meter_type = ?
+        ''', (inv_num, meter_type))
+        
+        # Обновляем статус запроса
+        cursor.execute('''
+            UPDATE pending_requests
+            SET status = 'confirmed', processed_by = ?, processed_at = ?
+            WHERE request_id = ?
+        ''', (query.from_user.id, datetime.now(), request_id))
+        conn.commit()
+        
+        # Уведомляем пользователя
         context.bot.send_message(
-            chat_id=recipient_chat_id,
-            text=formatted_message,
-            parse_mode='HTML'
+            chat_id=user_tab,
+            text=f"✅ Ваш запрос на отметку оборудования как 'Убыло' подтвержден:\n"
+                 f"Инв. №: {inv_num}\n"
+                 f"Счётчик: {meter_type}\n\n"
+                 f"Оборудование успешно помечено как убывшее с локации."
         )
-        update.message.reply_text("✅ Ваше сообщение успешно отправлено!")
+        
+        # Отправляем подтверждение администратору
+        query.edit_message_text(
+            f"✅ Вы подтвердили запрос на отметку как 'Убыло':\n"
+            f"Инв. №: {inv_num}\n"
+            f"Счётчик: {meter_type}\n"
+            f"Пользователь: {user_name}\n\n"
+            f"Статус успешно обновлен."
+        )
+        
     except Exception as e:
-        logger.error(f"Ошибка при отправке сообщения: {e}")
-        update.message.reply_text(
-            "❌ Произошла ошибка при отправке сообщения. Пожалуйста, попробуйте позже."
+        logger.error(f"Ошибка подтверждения статуса 'Убыло': {e}")
+        query.edit_message_text("❌ Произошла ошибка при обработке запроса")
+
+def handle_ubylo_rejection(update: Update, context: CallbackContext):
+    """Обработка отклонения статуса 'Убыло' администратором"""
+    query = update.callback_query
+    query.answer()
+    
+    request_id = query.data.replace('reject_ubylo_', '')
+    
+    try:
+        # Получаем информацию о запросе
+        cursor.execute('''
+            SELECT inv_num, meter_type, user_tab, user_name, location, division
+            FROM pending_requests
+            WHERE request_id = ?
+        ''', (request_id,))
+        request_info = cursor.fetchone()
+        
+        if not request_info:
+            query.edit_message_text("Ошибка: запрос не найден")
+            return
+            
+        inv_num, meter_type, user_tab, user_name, location, division = request_info
+        
+        # Обновляем статус запроса
+        cursor.execute('''
+            UPDATE pending_requests
+            SET status = 'rejected', processed_by = ?, processed_at = ?
+            WHERE request_id = ?
+        ''', (query.from_user.id, datetime.now(), request_id))
+        conn.commit()
+        
+        # Уведомляем пользователя
+        context.bot.send_message(
+            chat_id=user_tab,
+            text=f"❌ Ваш запрос на отметку оборудования как 'Убыло' отклонен:\n"
+                 f"Инв. №: {inv_num}\n"
+                 f"Счётчик: {meter_type}\n\n"
+                 f"Пожалуйста, проверьте данные и обратитесь к администратору."
         )
-    
-    # Очищаем данные контакта
-    for key in ['contact_admin_tab', 'contact_admin_name', 'contact_operator_tab', 
-               'contact_operator_name', 'contact_manager_tab', 'contact_manager_name',
-               'waiting_for_message_to_admin', 'waiting_for_message_to_operator',
-               'waiting_for_message_to_manager', 'operators_by_location', 'managers_by_location']:
-        if key in context.user_data:
-            del context.user_data[key]
-    
-    return ConversationHandler.END
+        
+        # Отправляем подтверждение администратору
+        query.edit_message_text(
+            f"❌ Вы отклонили запрос на отметку как 'Убыло':\n"
+            f"Инв. №: {inv_num}\n"
+            f"Счётчик: {meter_type}\n"
+            f"Пользователь: {user_name}\n\n"
+            f"Пользователь уведомлен об отклонении."
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка отклонения статуса 'Убыло': {e}")
+        query.edit_message_text("❌ Произошла ошибка при обработке запроса")
+
 
 def main():
     # Инициализация бота
@@ -1563,39 +1193,22 @@ def main():
     
     # Add handlers in order of priority
     # Main conversation handler (highest priority)
-    dp.add_handler(conv_handler, group=1)
+    dp.add_handler(conv_handler)
     logger.info("Зарегистрирован обработчик диалога ввода табельного номера")
     
     # Command handlers (medium priority)
-    # dp.add_handler(CommandHandler('admin_command', admin_command), group=2)
-    # dp.add_handler(CommandHandler('manager_command', manager_command), group=2)
-    # dp.add_handler(CommandHandler('user_command', user_command), group=2)
+    # dp.add_handler(CommandHandler('admin_command', admin_command))
+    # dp.add_handler(CommandHandler('manager_command', manager_command))
+    # dp.add_handler(CommandHandler('user_command', user_command))
     # logger.info("Зарегистрированы обработчики команд для разных ролей")
     
     # Button handlers (medium priority)
-    dp.add_handler(MessageHandler(Filters.regex('^(В начало)$'), handle_button), group=2)
-    dp.add_handler(MessageHandler(Filters.regex('^Загрузить показания$'), handle_upload_readings), group=2)
-    
-    # Contact button handlers (medium priority)
-    dp.add_handler(MessageHandler(Filters.regex('^Связаться с оператором$'), handle_contact_operator), group=2)
-    logger.info("Зарегистрированы обработчики кнопок связи")
-    
-    # Callback query handlers (medium priority)
-    dp.add_handler(CallbackQueryHandler(handle_select_location, pattern='^select_location_'), group=2)
-    dp.add_handler(CallbackQueryHandler(handle_select_division, pattern='^select_division_'), group=2)
-    dp.add_handler(CallbackQueryHandler(handle_select_mgr_location, pattern='^select_mgr_location_'), group=2)
-    dp.add_handler(CallbackQueryHandler(handle_back_to_locations, pattern='^back_to_locations$'), group=2)
-    dp.add_handler(CallbackQueryHandler(handle_back_to_mgr_locations, pattern='^back_to_mgr_locations$'), group=2)
-    dp.add_handler(CallbackQueryHandler(handle_cancel_contact, pattern='^cancel_contact$'), group=2)
-    logger.info("Зарегистрированы обработчики callback-запросов")
+    dp.add_handler(MessageHandler(Filters.regex('^(В начало)$'), handle_button))
+    dp.add_handler(MessageHandler(Filters.regex('^Загрузить показания$'), handle_upload_readings))
     
     # General message handler (lowest priority)
-    dp.add_handler(MessageHandler(
-        Filters.text & ~Filters.command & ~Filters.regex('^(В начало)$') & 
-        ~Filters.regex('^Загрузить показания$') & 
-        ~Filters.regex('^Связаться с оператором$'),
-        handle_message_input
-    ), group=3)
+    dp.add_handler(MessageHandler(Filters.regex('^(В начало)$'), handle_button))
+    dp.add_handler(MessageHandler(Filters.regex('^Загрузить показания$'), handle_upload_readings))
     
     # Обработчики для ввода показаний
     readings_conv_handler = ConversationHandler(
@@ -1628,30 +1241,6 @@ def main():
     )
     dp.add_handler(readings_conv_handler)
     logger.info("Зарегистрирован обработчик ввода показаний")
-    
-    # Обработчик контактов между пользователями
-    contact_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(Filters.regex('^Связаться с (администратором|оператором|руководителем)$'),
-                         lambda update, context: handle_button(update, context))
-        ],
-        states={
-            CONTACT_MESSAGE: [
-                CallbackQueryHandler(handle_user_selection, pattern='^user_|^cancel_contact'),
-                MessageHandler(Filters.text & ~Filters.command, handle_contact_message)
-            ]
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            MessageHandler(Filters.regex('^Отмена$'), cancel),
-            CallbackQueryHandler(handle_cancel_contact, pattern='^cancel_contact$')
-        ],
-        per_chat=True,
-        per_message=True,
-        name="contact_conversation"
-    )
-    dp.add_handler(contact_handler)
-    logger.info("Зарегистрирован обработчик контактов между пользователями")
     
     # Настройка обработчиков для работы с показаниями счетчиков
     from meters_handler import setup_meters_handlers
@@ -1734,7 +1323,53 @@ def init_database():
                 UNIQUE(date, employee_name)
             )
         ''')
+
+        # Создаем таблицу для последних показаний
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS meter_readings_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inventory_number TEXT NOT NULL,
+                meter_type TEXT NOT NULL,
+                reading REAL,
+                comment TEXT,
+                user_name TEXT NOT NULL,
+                location TEXT NOT NULL,
+                division TEXT NOT NULL,
+                reading_date DATETIME NOT NULL,
+                report_week TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                UNIQUE(inventory_number, meter_type, reading_date)
+            )
+        ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pending_requests (
+                request_id TEXT PRIMARY KEY,
+                inv_num TEXT NOT NULL,
+                meter_type TEXT NOT NULL,
+                user_tab INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                location TEXT NOT NULL,
+                division TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                processed_by INTEGER,
+                processed_at DATETIME,
+                timestamp DATETIME NOT NULL,
+                FOREIGN KEY (user_tab) REFERENCES Users_user_bot(tab_number)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS equipment (
+                inventory_number TEXT NOT NULL,
+                meter_type TEXT NOT NULL,
+                location TEXT,
+                division TEXT,
+                status TEXT DEFAULT 'active',
+                PRIMARY KEY (inventory_number, meter_type)
+            )
+        ''')
+
         conn.commit()
         logger.info("База данных успешно инициализирована")
         

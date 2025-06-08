@@ -6,14 +6,6 @@ import logging
 from telegram import InputFile
 import io
 
-from shifts_handler import ShiftsHandler
-
-def send_absence_notifications(context):
-    handler = ShiftsHandler()
-    absent_users = handler.get_absent_users()
-    for user in absent_users:
-        context.bot.send_message(...)
-
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',

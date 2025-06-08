@@ -59,49 +59,27 @@ class ShiftsHandler:
     def load_tabel(self):
         """Загрузка и обработка данных из табеля"""
         try:
-            # Чтение файла табеля
             df = pd.read_excel('tabels.xlsx')
             
-            # Получаем текущую дату
             current_date = datetime.now().strftime('%d.%m.%Y')
             
-            # Преобразуем все даты в столбцах в правильный формат
             date_columns = []
             for col in df.columns:
                 if col != 'ФИО':
                     try:
-                        # Пробуем разные форматы дат
-                        if isinstance(col, datetime):
-                            date_str = col.strftime('%d.%m.%Y')
-                        elif isinstance(col, str):
-                            # Пробуем разные форматы
-                            try:
-                                date_obj = datetime.strptime(col, '%d.%m.%Y')
-                            except ValueError:
-                                try:
-                                    date_obj = datetime.strptime(col, '%Y-%m-%d')
-                                except ValueError:
-                                    logger.warning(f"Пропускаем некорректную дату в столбце: {col}")
-                                    continue
+                        date_obj = pd.to_datetime(col, dayfirst=True, errors='coerce')
+                        if pd.notna(date_obj):
                             date_str = date_obj.strftime('%d.%m.%Y')
-                        else:
-                            logger.warning(f"Пропускаем столбец с неизвестным форматом даты: {col}")
-                            continue
-                        
-                        # Переименовываем столбец с правильным форматом даты
-                        if col != date_str:
                             df = df.rename(columns={col: date_str})
-                        date_columns.append(date_str)
+                            date_columns.append(date_str)
                     except Exception as e:
                         logger.warning(f"Ошибка при обработке даты {col}: {e}")
                         continue
             
-            # Если текущей даты нет в заголовках, добавляем её
+            # Если текущей даты нет
             if current_date not in df.columns:
                 logger.info(f"Добавление новой даты {current_date} в табель")
-                # Копируем статусы с предыдущего дня, если они есть
                 if date_columns:
-                    # Сортируем даты и берем последнюю
                     last_date = sorted(date_columns, 
                                     key=lambda x: datetime.strptime(x, '%d.%m.%Y'))[-1]
                     df[current_date] = df[last_date]
@@ -109,21 +87,16 @@ class ShiftsHandler:
                     # Если нет предыдущих дат, заполняем "НЕТ"
                     df[current_date] = "НЕТ"
                 
-                # Сохраняем обновленный табель
                 df.to_excel('tabels.xlsx', index=False)
                 logger.info(f"Табель обновлен с новой датой {current_date}")
             
-            # Получаем статусы на текущий день
             current_statuses = df[['ФИО', current_date]].copy()
             current_statuses.columns = ['employee_name', 'status']
             
-            # Удаляем старые записи за текущую дату
             self.cursor.execute('DELETE FROM daily_shifts WHERE date = ?', (current_date,))
             
-            # Добавляем новые записи
             for _, row in current_statuses.iterrows():
-                if pd.notna(row['status']):  # Проверяем, что статус не пустой
-                    # Преобразуем статус в строку и приводим к верхнему регистру
+                if pd.notna(row['status']):
                     status = str(row['status']).strip().upper()
                     self.cursor.execute('''
                         INSERT INTO daily_shifts (date, employee_name, status)
@@ -134,22 +107,18 @@ class ShiftsHandler:
             
         except FileNotFoundError:
             logger.error("Файл tabels.xlsx не найден. Создаем новый файл.")
-            # Создаем новый файл табеля
             try:
-                # Получаем список сотрудников из базы данных
                 self.cursor.execute('SELECT name FROM Users_user_bot')
                 employees = [row[0] for row in self.cursor.fetchall()]
                 
-                # Создаем новый DataFrame
                 df = pd.DataFrame({'ФИО': employees})
                 current_date = datetime.now().strftime('%d.%m.%Y')
                 df[current_date] = "НЕТ"  # По умолчанию все "НЕТ"
                 
-                # Сохраняем новый табель
                 df.to_excel('tabels.xlsx', index=False)
                 logger.info("Создан новый файл tabels.xlsx")
                 
-                # Рекурсивно вызываем функцию для обработки нового файла
+                # Рекурсия...
                 self.load_tabel()
                 
             except Exception as e:
@@ -157,7 +126,6 @@ class ShiftsHandler:
             
         except Exception as e:
             logger.error(f"Ошибка при загрузке табеля: {e}")
-            # Добавляем дополнительную информацию для отладки
             if 'strptime()' in str(e):
                 logger.error("Ошибка в формате даты. Текущие колонки в табеле:")
                 try:
