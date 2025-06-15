@@ -148,22 +148,10 @@ class ShiftsHandler:
             return []
 
     def check_employee_status(self, employee_name: str) -> str:
-        try:
-            current_date = datetime.now().strftime('%d.%m.%Y')
-            self.cursor.execute('''
-                SELECT status FROM daily_shifts 
-                WHERE date = ? AND employee_name = ?
-            ''', (current_date, employee_name))
-            result = self.cursor.fetchone()
-            return result[0] if result else "НЕТ"
-        except Exception as e:
-            logger.error(f"Ошибка проверки статуса: {e}")
-            return "НЕТ"
+        return "ДА"
 
     def is_user_available(self, employee_name):
-        """Проверка доступности сотрудника (на вахте)"""
-        status = self.check_employee_status(employee_name)
-        return status == "ДА"
+        return True
 
     def get_active_users(self):
         """Получение списка активных пользователей на текущий день"""

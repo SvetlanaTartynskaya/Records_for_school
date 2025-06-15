@@ -1,20 +1,23 @@
-import io
 import pandas as pd
 import os
 from datetime import datetime
 import sqlite3
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackContext, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+import os
+from db_utils import db_transaction
 
 logger = logging.getLogger(__name__)
 
 class MeterValidator:
     """Класс для валидации показаний счетчиков"""
-    
     def __init__(self):
         self.equipment_df = None
         self.conn = sqlite3.connect('Users_bot.db', check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.cursor = self.conn.cursor()
+        self.load_equipment()
         self.cursor = self.conn.cursor()
         self.load_equipment()
 
@@ -43,164 +46,20 @@ class MeterValidator:
                 logger.warning("Справочник оборудования пуст")
                 return pd.DataFrame()
             
-            # Фильтруем оборудование по локации и подразделению
             mask = (
                 (self.equipment_df['Локация'] == location) & 
                 (self.equipment_df['Подразделение'] == division)
             )
             result_df = self.equipment_df[mask].copy()
-            logger.info(f"Найдено {len(result_df)} единиц оборудования для локации {location} и подразделения {division}")
+            
+            if result_df.empty:
+                logger.warning(f"Не найдено оборудования для {location}, {division}")
+                
             return result_df
         except Exception as e:
-            logger.error(f"Ошибка получения оборудования для локации/подразделения: {e}")
+            logger.error(f"Ошибка получения оборудования: {e}")
             return pd.DataFrame()
-    
-    def _get_last_reading(self, inv_num, meter_type):
-        """Получение последнего показания для данного счетчика"""
-        try:
-            self.cursor.execute('''
-                SELECT reading, reading_date
-                FROM meter_readings_history
-                WHERE inventory_number = ? AND meter_type = ?
-                ORDER BY reading_date DESC
-                LIMIT 1
-            ''', (inv_num, meter_type))
-            
-            result = self.cursor.fetchone()
-            if result:
-                return {
-                    'reading': result[0],
-                    'reading_date': result[1]
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка получения последнего показания: {e}")
-            return None
         
-    def handle_ubylo_status(self, inv_num: str, meter_type: str, user_info: dict) -> dict:
-        """Обработка статуса 'Убыло' с подтверждением администратора"""
-        try:
-            # Получаем информацию об оборудовании
-            self.cursor.execute('''
-                SELECT location, division FROM equipment 
-                WHERE inventory_number = ? AND meter_type = ?
-            ''', (inv_num, meter_type))
-            equipment_info = self.cursor.fetchone()
-            
-            if not equipment_info:
-                return {'status': 'error', 'message': 'Оборудование не найдено'}
-            
-            equipment_location, equipment_division = equipment_info
-            
-            # Получаем администраторов для этого подразделения
-            admins = self.get_admin_for_division(equipment_division)
-            
-            if not admins:
-                return {'status': 'error', 'message': 'Не найдены администраторы для подтверждения'}
-            
-            # Создаем запрос на подтверждение
-            request_id = f"ubylo_{inv_num}_{meter_type}_{datetime.now().timestamp()}"
-            
-            # Сохраняем запрос в базу данных
-            self.cursor.execute('''
-                INSERT INTO pending_requests 
-                (request_id, inv_num, meter_type, user_tab, user_name, location, division, status, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (request_id, inv_num, meter_type, user_info['tab_number'], user_info['name'], 
-                equipment_location, equipment_division, 'pending', datetime.now()))
-            self.conn.commit()
-            
-            # Отправляем уведомления администраторам
-            admin_keyboard = []
-            for admin_tab, admin_name in admins:
-                admin_keyboard.append([
-                    InlineKeyboardButton(
-                        f"Подтвердить для {inv_num} ({meter_type})",
-                        callback_data=f"confirm_ubylo_{request_id}"
-                    ),
-                    InlineKeyboardButton(
-                        "Отклонить",
-                        callback_data=f"reject_ubylo_{request_id}"
-                    )
-                ])
-            
-            reply_markup = InlineKeyboardMarkup(admin_keyboard)
-            
-            message = (
-                f"🚨 *Требуется подтверждение администратора*\n\n"
-                f"Пользователь {user_info['name']} отметил оборудование как 'Убыло':\n"
-                f"Инв. №: {inv_num}\n"
-                f"Счётчик: {meter_type}\n"
-                f"Локация: {equipment_location}\n"
-                f"Подразделение: {equipment_division}\n\n"
-                f"Пожалуйста, подтвердите или отклоните этот запрос:"
-            )
-            
-            # Возвращаем информацию для отправки уведомлений администраторам
-            return {
-                'status': 'pending',
-                'request_id': request_id,
-                'admins': admins,
-                'message': message,
-                'reply_markup': reply_markup
-            }
-            
-        except Exception as e:
-            logger.error(f"Ошибка обработки статуса 'Убыло': {e}")
-            return {'status': 'error', 'message': str(e)}
-    
-    def save_to_history(self, report_df, week_number):
-        """Сохраняет данные отчета в таблицу meter_readings_history"""
-        try:
-            # Проверяем и преобразуем данные
-            required_columns = ['Гос. номер', 'Инв. №', 'Счётчик', 'Показания', 
-                            'Комментарий', 'Дата', 'Подразделение', 'Локация', 'Отправитель']
-            
-            if not all(col in report_df.columns for col in required_columns):
-                logger.error("Отсутствуют необходимые колонки в отчете")
-                return False
-                
-            # Подготовка данных для вставки
-            data_to_insert = []
-            for _, row in report_df.iterrows():
-                data_to_insert.append((
-                    row['Инв. №'],
-                    row['Счётчик'],
-                    float(row['Показания']) if pd.notna(row['Показания']) else None,
-                    row['Комментарий'] if pd.notna(row['Комментарий']) else '',
-                    row['Отправитель'],
-                    row['Локация'],
-                    row['Подразделение'],
-                    datetime.strptime(row['Даата'], '%Y-%m-%d %H:%M:%S') if isinstance(row['Дата'], str) else row['Дата'],
-                    week_number,
-                    datetime.now()
-                ))
-            
-            # Вставка данных в базу
-            self.cursor.executemany('''
-                INSERT INTO meter_readings_history (
-                    inventory_number, 
-                    meter_type, 
-                    reading, 
-                    comment, 
-                    user_name, 
-                    location, 
-                    division, 
-                    reading_date, 
-                    report_week, 
-                    timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', data_to_insert)
-            
-            self.conn.commit()
-            logger.info(f"Успешно сохранено {len(data_to_insert)} записей в историю показаний")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка сохранения в историю показаний: {e}")
-            self.conn.rollback()
-            return False
-    
     def _get_days_between(self, last_date_str):
         """Вычисление количества дней между датами"""
         try:
@@ -211,7 +70,299 @@ class MeterValidator:
         except Exception as e:
             logger.error(f"Ошибка расчета дней между датами: {e}")
             return 1  # По умолчанию возвращаем 1 день
+    
+    def _get_last_reading(self, inv_num, meter_type):
+        """Получение последнего показания для данного счетчика из final_report"""
+        try:
+            self.cursor.execute('''
+                SELECT reading, date
+                FROM final_report
+                WHERE inv_number = ? AND meter_type = ?
+                ORDER BY date DESC
+                LIMIT 1
+            ''', (inv_num, meter_type))
+            
+            result = self.cursor.fetchone()
+            if result:
+                return {
+                    'reading': float(result[0]) if result[0] is not None else None,
+                    'reading_date': result[1]
+                }
+            return None  # Возвращаем None, если показаний нет
+        except Exception as e:
+            logger.error(f"Ошибка получения последнего показания: {e}")
+            return None
+        
+    def _get_admins_for_division(self, division):
+        """Исправленная версия с использованием контекстного менеджера"""
+        try:
+            with db_transaction() as cursor:
+                cursor.execute('''
+                    SELECT tab_number, name, chat_id FROM Users_admin_bot 
+                    WHERE division = ? AND chat_id IS NOT NULL
+                ''', (division,))
+                admins = cursor.fetchall()
+                
+                if not admins:
+                    cursor.execute('''
+                        SELECT tab_number, name, chat_id FROM Users_admin_bot 
+                        WHERE chat_id IS NOT NULL AND role = 'Администратор'
+                    ''')
+                    admins = cursor.fetchall()
+                
+                return admins
+        except Exception as e:
+            logger.error(f"Ошибка при поиске администраторов: {str(e)}")
+            return []
+        
+    def _has_pending_ubylo(self, inv_num: str, meter_type: str) -> bool:
+        """Проверяет наличие активного запроса 'Убыло' для оборудования"""
+        try:
+            self.cursor.execute('''
+                SELECT 1 FROM pending_requests 
+                WHERE inv_num = ? AND meter_type = ? 
+                AND status = 'pending'
+                AND timestamp > datetime('now', '-5 days')
+            ''', (inv_num, meter_type))
+            return self.cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Ошибка проверки pending-статуса: {e}")
+            return False
+        
+    def handle_ubylo_status(self, context, inv_num, meter_type, user_info):
+        try:
+            if self._has_pending_ubylo(inv_num, meter_type):
+                return {'status': 'pending', 'message': 'Запрос уже существует'}
+            
+            request_id = f"ubylo_{datetime.now().timestamp()}"
+            user_chat_id = user_info.get('chat_id')
+            
+            if not user_chat_id:
+                self.cursor.execute('SELECT chat_id FROM Users_user_bot WHERE tab_number = ?', (user_info['tab_number'],))
+                result = self.cursor.fetchone()
+                user_chat_id = result[0] if result else None
+            
+            if not user_chat_id:
+                logger.error(f"Не удалось определить chat_id пользователя {user_info['tab_number']}")
+                return {'status': 'error', 'message': 'Не удалось определить chat_id пользователя'}
 
+            # Сохраняем запрос в базу
+            with db_transaction() as cursor:
+                self.cursor.execute('''
+                    INSERT INTO pending_requests (
+                        request_id, inv_num, meter_type, user_tab, user_name, 
+                        location, division, timestamp, status, user_chat_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    request_id, inv_num, meter_type,
+                    user_info['tab_number'], user_info['name'],
+                    user_info.get('location', ''), user_info.get('division', ''),
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'pending', user_chat_id
+                ))
+                self.conn.commit()
+
+            admins = self._get_admins_for_division(user_info.get('division', ''))
+            if not admins:
+                logger.warning("Нет администраторов с chat_id")
+                return {'status': 'error', 'message': 'Нет доступных администраторов'}
+
+            sent_to = set()
+            for admin_tab, admin_name, admin_chat_id in admins:
+                if admin_chat_id in sent_to:
+                    continue
+                    
+                try:
+                    keyboard = [
+                        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_ubylo_{request_id}")],
+                        [InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_ubylo_{request_id}")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    context.bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=f"⚠️ Запрос на отметку 'Убыло'\n\n"
+                            f"Инв. №: {inv_num}\nСчётчик: {meter_type}\n"
+                            f"Пользователь: {user_info['name']}\n"
+                            f"Локация: {user_info.get('location', '')}\n"
+                            f"Подразделение: {user_info.get('division', '')}",
+                        reply_markup=reply_markup
+                    )
+                    sent_to.add(admin_chat_id)
+                    logger.info(f"Уведомление отправлено администратору {admin_name} (chat_id: {admin_chat_id})")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления администратору {admin_name}: {str(e)}")
+
+            return {'status': 'pending', 'request_id': request_id}
+        except Exception as e:
+            logger.error(f"Ошибка в handle_ubylo_status: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+            
+    def validate_file(self, file_path, user_info, context=None):
+        """Улучшенная валидация файла с показаниями"""
+        try:
+            if not all(k in user_info for k in ['tab_number', 'name', 'location', 'division']):
+                return {
+                    'is_valid': False,
+                    'errors': ["Отсутствуют необходимые данные пользователя"],
+                    'warnings': []
+                }
+                
+            # Чтение и проверка файла
+            readings_df = pd.read_excel(file_path).dropna(how='all')
+            
+            # Проверка обязательных колонок
+            required_columns = {
+                '№ п/п': ['№ п/п', '№', 'Номер', 'П/П'],
+                'Гос. номер': ['Гос. номер', 'Гос номер', 'Номер', 'ГРЗ'],
+                'Инв. №': ['Инв. №', 'Инв №', 'Инвентарный номер'],
+                'Счётчик': ['Счётчик', 'Счетчик', 'Тип счетчика'],
+                'Показания': ['Показания', 'Значение', 'Текущие показания'],
+                'Комментарий': ['Комментарий', 'Примечание', 'Статус']
+            }
+            
+            # Стандартизация названий колонок
+            columns_map = {}
+            for standard_col, variants in required_columns.items():
+                for col in readings_df.columns:
+                    if col in variants:
+                        columns_map[col] = standard_col
+                        break
+            
+            readings_df = readings_df.rename(columns=columns_map)
+            
+            # Проверка наличия обязательных колонок
+            missing_columns = [col for col in required_columns if col not in readings_df.columns]
+            if missing_columns:
+                return {
+                    'is_valid': False,
+                    'errors': [f"Отсутствуют обязательные колонки: {', '.join(missing_columns)}"],
+                    'warnings': []
+                }
+            
+            # Получаем список оборудования для локации и подразделения
+            equipment_df = self._get_equipment_for_location_division(
+                user_info['location'],
+                user_info['division']
+            )
+            
+            errors = []
+            warnings = []
+            pending_ubylo_requests = []
+            
+            # Обработка комментариев и валидация данных
+            for idx, row in readings_df.iterrows():
+                comment = str(row['Комментарий']).strip() if pd.notna(row['Комментарий']) else None
+                
+                # Обработка "В ремонте"
+                if comment == "В ремонте":
+                    if pd.isna(row['Показания']):
+                        last_reading = self._get_last_reading(row['Инв. №'], row['Счётчик'])
+                        if last_reading and last_reading['reading'] is not None:
+                            readings_df.at[idx, 'Показания'] = last_reading['reading']
+                            warnings.append(f"Строка {idx + 1}: Автоматически использовано последнее показание для оборудования в ремонте")
+                
+                # Обработка "Убыло"
+                elif comment == "Убыло":
+                    if pd.notna(row['Показания']):
+                        readings_df.at[idx, 'Показания'] = None
+                        warnings.append(f"Строка {idx + 1}: Показания игнорированы для оборудования с статусом 'Убыло'")
+                    
+                    # Проверяем статус подтверждения
+                    self.cursor.execute('''
+                        SELECT status FROM pending_requests 
+                        WHERE inv_num = ? AND meter_type = ?
+                        AND timestamp > datetime('now', '-5 days')
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    ''', (row['Инв. №'], row['Счётчик']))
+                    
+                    result = self.cursor.fetchone()
+                    
+                    if result:
+                        status = result[0]
+                        if status == 'pending':
+                            # Для pending запроса НЕ добавляем уведомление пользователю
+                            continue
+                        elif status == 'rejected':
+                            errors.append(f"Строка {idx + 1}: Статус 'Убыло' был отклонен администратором")
+                    elif context is not None:
+                        # Если запроса нет - создаем новый и уведомляем пользователя
+                        request_result = self.handle_ubylo_status(
+                            context, 
+                            row['Инв. №'], 
+                            row['Счётчик'], 
+                            user_info
+                        )
+                        
+                        if request_result.get('status') == 'pending':
+                            pending_ubylo_requests.append({
+                                'row': idx + 1,
+                                'inv_num': row['Инв. №'],
+                                'meter_type': row['Счётчик'],
+                                'request_id': request_result['request_id']
+                            })
+                            warnings.append(f"Строка {idx + 1}: Создан запрос на подтверждение статуса 'Убыло'")
+                        else:
+                            errors.append(
+                                f"Строка {idx + 1}: Ошибка создания запроса: " +
+                                request_result.get('message', 'Неизвестная ошибка')
+                            )
+            
+            # Проверка каждой строки (основные проверки показаний)
+            for idx, row in readings_df.iterrows():
+                # Пропускаем строки с "Убыло" - они уже обработаны
+                comment = str(row['Комментарий']).strip() if pd.notna(row['Комментарий']) else None
+                if comment == "Убыло":
+                    continue
+                    
+                equipment_mask = (
+                    (equipment_df['Гос. номер'] == row['Гос. номер']) &
+                    (equipment_df['Инв. №'] == row['Инв. №']) &
+                    (equipment_df['Счётчик'] == row['Счётчик'])
+                )
+                
+                if not equipment_df[equipment_mask].empty:
+                    # Проверка показаний
+                    if not pd.isna(row['Показания']):
+                        try:
+                            value = float(row['Показания'])
+                            if value < 0:
+                                errors.append(f"Строка {idx + 1}: Показания не могут быть отрицательными")
+                                continue
+                                
+                            last_reading = self._get_last_reading(row['Инв. №'], row['Счётчик'])
+                            if last_reading and last_reading['reading'] is not None and value < last_reading['reading']:
+                                errors.append(f"Строка {idx + 1}: Показание ({value}) меньше предыдущего ({last_reading['reading']})")
+                                continue
+                                
+                        except ValueError:
+                            errors.append(f"Строка {idx + 1}: Показания должны быть числом")
+                            continue
+                
+                else:
+                    errors.append(f"Строка {idx + 1}: Оборудование не найдено (Гос. номер: {row['Гос. номер']}, Инв. №: {row['Инв. №']}, Счётчик: {row['Счётчик']}")
+            
+            if errors:
+                return {
+                    'is_valid': False,
+                    'errors': errors,
+                    'warnings': warnings,
+                    'pending_ubylo_requests': pending_ubylo_requests
+                }
+            
+            return {
+                'is_valid': True,
+                'warnings': warnings,
+                'pending_ubylo_requests': pending_ubylo_requests
+            }
+                
+        except Exception as e:
+            logger.error(f"Ошибка при валидации файла: {e}")
+            return {
+                'is_valid': False,
+                'errors': [f"Ошибка при валидации файла: {str(e)}"]
+            }
+            
     def get_admin_for_division(self, division):
         """Получение ID администратора для данного подразделения"""
         try:
@@ -240,167 +391,228 @@ class MeterValidator:
             logger.error(f"Ошибка получения администратора для подразделения: {e}")
             return []
         
-    def validate_file(self, file_path, user_info):
-        """Улучшенная валидация файла с показаниями"""
+    def finish_admin_readings(self, df, user_info=None):
+        """Сохранение показаний администратора в финальный отчет"""
         try:
-            # Загружаем файл с показаниями
-            readings_df = pd.read_excel(file_path)
-            logger.info(f"Загружен файл показаний: {file_path}")
+            # Добавляем метаданные пользователя
+            if user_info:
+                required_fields = ['name', 'location', 'division']
+                if all(field in user_info for field in required_fields):
+                    df['name'] = user_info['name']
+                    df['location'] = user_info['location']
+                    df['division'] = user_info['division']
+                    
+                    if 'tab_number' in user_info:
+                        df['tab_number'] = user_info['tab_number']
+                else:
+                    logger.warning("Не все обязательные поля пользователя предоставлены")
             
-            # Проверяем наличие всех необходимых колонок
-            required_columns = ['№ п/п', 'Гос. номер', 'Инв. №', 'Счётчик', 'Показания', 'Комментарий']
-            missing_columns = [col for col in required_columns if col not in readings_df.columns]
+            # Проверяем наличие обязательных колонок
+            required_columns = ['Гос. номер', 'Инв. №', 'Счётчик', 'name', 'location', 'division']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
             if missing_columns:
                 return {
-                    'is_valid': False,
-                    'errors': [f"Отсутствуют обязательные колонки: {', '.join(missing_columns)}"]
+                    'status': 'error',
+                    'message': f"Отсутствуют обязательные колонки: {', '.join(missing_columns)}"
                 }
-            
-            # Получаем список оборудования для локации и подразделения
-            equipment_df = self._get_equipment_for_location_division(
-                user_info['location'],
-                user_info['division']
-            )
-            
-            errors = []
-            warnings = []
-            
-            # Проверяем каждую строку с показаниями
-            for idx, row in readings_df.iterrows():
-                # Проверяем существование оборудования
-                equipment_mask = (
-                    (equipment_df['Гос. номер'] == row['Гос. номер']) &
-                    (equipment_df['Инв. №'] == row['Инв. №']) &
-                    (equipment_df['Счётчик'] == row['Счётчик'])
-                )
                 
-                if not equipment_df[equipment_mask].empty:
-                    equipment = equipment_df[equipment_mask].iloc[0]
+            # Сохраняем в базу данных
+            with db_transaction() as cursor:
+                for _, row in df.iterrows():
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO final_report (
+                            gov_number, inv_number, meter_type, reading, comment,
+                            name, date, division, location, sender
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        row['Гос. номер'],
+                        row['Инв. №'],
+                        row['Счётчик'],
+                        row['Показания'] if pd.notna(row['Показания']) else None,
+                        row['Комментарий'] if pd.notna(row['Комментарий']) else '',
+                        row['name'],
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        row['division'],
+                        row['location'],
+                        'Администратор'
+                    ))
+            
+            return {'status': 'success', 'message': 'Показания успешно сохранены'}
+                
+        except Exception as e:
+            logger.error(f"Ошибка сохранения показаний администратора: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
+    def save_to_final_report(self, file_path_or_df, user_tab_number=None):
+        """Сохранение данных из Excel в final_report с получением user_info из БД"""
+        try:
+            if isinstance(file_path_or_df, str):
+                df = pd.read_excel(file_path_or_df)
+            elif isinstance(file_path_or_df, pd.DataFrame):
+                df = file_path_or_df
+            else:
+                return {'status': 'error', 'message': 'Invalid input type'}
+                
+            # Если передан tab_number, получаем данные пользователя из БД
+            user_info = {}
+            if user_tab_number:
+                with db_transaction() as cursor:
+                    cursor.execute('''
+                        SELECT name, location, division FROM Users_user_bot 
+                        WHERE tab_number = ?
+                    ''', (user_tab_number,))
+                    user_data = cursor.fetchone()
                     
-                    # Проверка 1: Если показания пустые, должен быть комментарий
-                    if pd.isna(row['Показания']) and pd.isna(row['Комментарий']):
-                        errors.append(f"Строка {idx + 1}: Необходимо указать либо показания, либо комментарий")
+                    if user_data:
+                        user_info = {
+                            'name': user_data[0],
+                            'location': user_data[1],
+                            'division': user_data[2],
+                            'tab_number': user_tab_number
+                        }
+            
+            # Добавляем метаданные пользователя в DataFrame
+            if user_info:
+                df['name'] = user_info['name']
+                df['location'] = user_info['location']
+                df['division'] = user_info['division']
+                df['tab_number'] = user_info['tab_number']
+                
+            # Проверяем обязательные колонки
+            required_columns = ['Гос. номер', 'Инв. №', 'Счётчик', 'name', 'location', 'division']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                return {
+                    'status': 'error',
+                    'message': f"Отсутствуют обязательные колонки: {', '.join(missing_columns)}"
+                }
+                
+            # Проверка на дубликаты (инв. номер + счётчик) в текущем DataFrame
+            duplicate_mask = df.duplicated(subset=['Инв. №', 'Счётчик'], keep=False)
+            if duplicate_mask.any():
+                duplicates = df[duplicate_mask][['Инв. №', 'Счётчик']].drop_duplicates()
+                return {
+                    'status': 'error',
+                    'message': f"Обнаружены дубликаты в загружаемых данных:\n{duplicates.to_string(index=False)}"
+                }
+                
+            # Проверка на дубликаты в базе данных
+            with db_transaction() as cursor:
+                for _, row in df.iterrows():
+                    cursor.execute('''
+                        SELECT 1 FROM final_report 
+                        WHERE inv_number = ? AND meter_type = ? 
+                        AND date >= datetime('now', '-5 days')
+                    ''', (row['Инв. №'], row['Счётчик']))
+                    
+                    if cursor.fetchone():
+                        return {
+                            'status': 'error',
+                            'message': f"Для инв. № {row['Инв. №']} и счетчика {row['Счётчик']} уже есть запись в базе за последние 5 дней"
+                        }
+            
+            # Сохраняем в базу данных
+            with db_transaction() as cursor:
+                for _, row in df.iterrows():
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO final_report (
+                            gov_number, inv_number, meter_type, reading, comment,
+                            name, date, division, location, sender
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        row['Гос. номер'],
+                        row['Инв. №'],
+                        row['Счётчик'],
+                        row['Показания'] if pd.notna(row['Показания']) else None,
+                        row['Комментарий'] if pd.notna(row['Комментарий']) else '',
+                        row['name'],
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        row['division'],
+                        row['location'],
+                        'Администратор' if not user_tab_number else 'Пользователь'
+                    ))
+            
+            return {'status': 'success', 'message': 'Показания успешно сохранены'}
+                
+        except Exception as e:
+            logger.error(f"Ошибка сохранения показаний: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+class FinalReportGenerator:
+    """Класс для генерации сводных отчетов по показаниям счетчиков"""
+    
+    def __init__(self, bot=None):
+        self.bot = bot
+        self.conn = sqlite3.connect('Users_bot.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.current_week = datetime.now().strftime('%Y-W%U')
+
+    def generate_final_report(self, week_folder):
+        """Генерация финального отчета за неделю"""
+        try:
+            report_data = []
+            week_number = os.path.basename(week_folder).replace('week_', '')
+            
+            for filename in os.listdir(week_folder):
+                if not filename.endswith('.xlsx'):
+                    continue
+                    
+                try:
+                    file_path = os.path.join(week_folder, filename)
+                    df = pd.read_excel(file_path)
+                    
+                    # Проверяем наличие необходимых колонок
+                    required_columns = ['Гос. номер', 'Инв. №', 'Счётчик', 'Показания', 'Комментарий']
+                    if not all(col in df.columns for col in required_columns):
+                        logger.error(f"Файл {filename} не содержит всех необходимых колонок")
                         continue
                     
-                    # Проверка 2: Если комментарий "В ремонте", используем последнее показание
-                    if str(row['Комментарий']).strip() == "В ремонте" and pd.isna(row['Показания']):
-                        last_reading = self._get_last_reading(row['Инв. №'], row['Счётчик'])
-                        if last_reading:
-                            readings_df.at[idx, 'Показания'] = last_reading['reading']
-                            warnings.append(f"Строка {idx + 1}: Автоматически использовано последнее показание для оборудования в ремонте")
+                    # Извлекаем метаданные
+                    user_info = {
+                        'name': df['name'].iloc[0] if 'name' in df.columns else 'Неизвестно',
+                        'location': df['location'].iloc[0] if 'location' in df.columns else 'Неизвестно',
+                        'division': df['division'].iloc[0] if 'division' in df.columns else 'Неизвестно',
+                        'timestamp': df['timestamp'].iloc[0] if 'timestamp' in df.columns else datetime.now()
+                    }
                     
-                    # Проверка 3: Если есть показания, проверяем их корректность
-                    if not pd.isna(row['Показания']):
-                        try:
-                            value = float(row['Показания'])
-                            if value < 0:
-                                errors.append(f"Строка {idx + 1}: Показания не могут быть отрицательными")
-                                continue
-                                
-                            # Проверка 4: Значение должно быть >= последнего
-                            last_reading = self._get_last_reading(row['Инв. №'], row['Счётчик'])
-                            if last_reading and value < last_reading['reading']:
-                                errors.append(f"Строка {idx + 1}: Показание ({value}) меньше предыдущего ({last_reading['reading']})")
-                                continue
-                                
-                            # Проверка 5: Для счетчиков PM - не более 24 в сутки
-                            if row['Счётчик'].startswith('PM') and last_reading:
-                                days_between = self._get_days_between(last_reading['reading_date'])
-                                if days_between > 0:
-                                    daily_change = (value - last_reading['reading']) / days_between
-                                    if daily_change > 24:
-                                        errors.append(f"Строка {idx + 1}: Для счетчика PM превышено максимальное изменение (24 в сутки). Текущее: {daily_change:.2f}")
-                                        continue
-                                        
-                            # Проверка 6: Для счетчиков KM - не более 500 в сутки
-                            if row['Счётчик'].startswith('KM') and last_reading:
-                                days_between = self._get_days_between(last_reading['reading_date'])
-                                if days_between > 0:
-                                    daily_change = (value - last_reading['reading']) / days_between
-                                    if daily_change > 500:
-                                        errors.append(f"Строка {idx + 1}: Для счетчика KM превышено максимальное изменение (500 в сутки). Текущее: {daily_change:.2f}")
-                                        continue
+                    # Добавляем данные в отчет
+                    for _, row in df.iterrows():
+                        report_data.append({
+                            'Гос. номер': row['Гос. номер'],
+                            'Инв. №': row['Инв. №'],
+                            'Счётчик': row['Счётчик'],
+                            'Показания': row['Показания'] if pd.notna(row['Показания']) else None,
+                            'Комментарий': row['Комментарий'] if pd.notna(row['Комментарий']) else '',
+                            'Наименование': row['Гос. номер'],
+                            'Дата': user_info['timestamp'],
+                            'Подразделение': user_info['division'],
+                            'Локация': user_info['location'],
+                            'Отправитель': user_info['name']
+                        })
                             
-                            # Проверка 7: Формат файла только Excel
-                            if not file_path.lower().endswith(('.xlsx', '.xls')):
-                                return {'is_valid': False, 'errors': ["Файл должен быть в формате Excel (.xlsx, .xls)"]}
-                        
-                        except ValueError:
-                            errors.append(f"Строка {idx + 1}: Показания должны быть числом")
-                            continue
-                    
-                    # Проверка 7: Допустимые значения комментариев
-                    if not pd.isna(row['Комментарий']):
-                        valid_comments = ["В ремонте", "Неисправен", "Убыло", "Нет на локации"]
-                        if str(row['Комментарий']).strip() not in valid_comments:
-                            errors.append(f"Строка {idx + 1}: Недопустимый комментарий. Допустимые значения: {', '.join(valid_comments)}")
-                else:
-                    errors.append(f"Строка {idx + 1}: Оборудование не найдено (Гос. номер: {row['Гос. номер']}, Инв. №: {row['Инв. №']}, Счётчик: {row['Счётчик']})")
+                except Exception as e:
+                    logger.error(f"Ошибка обработки файла {filename}: {e}")
+                    continue
             
-            if errors:
-                return {
-                    'is_valid': False,
-                    'errors': errors,
-                    'warnings': warnings
-                }
+            if not report_data:
+                return None
             
-            return {
-                'is_valid': True,
-                'warnings': warnings
-            }
+            report_df = pd.DataFrame(report_data)
+            
+            # Сохраняем в таблицу final_report
+            if not self.save_to_final_report(report_df):
+                return None
+        
+            # Также сохраняем в Excel (по желанию)
+            output_path = os.path.join(week_folder, f'final_report_{week_number}.xlsx')
+            report_df.to_excel(output_path, index=False)
+            
+            return output_path
             
         except Exception as e:
-            logger.error(f"Ошибка при валидации файла: {e}")
-            return {
-                'is_valid': False,
-                'errors': [f"Ошибка при валидации файла: {str(e)}"]
-            }
-    
-    
-    def generate_final_report(self, week_folder):
-        """Генерация и сохранение сводного отчета за неделю"""
-        report_data = []
-        week_number = os.path.basename(week_folder).replace('week_', '')
-        
-        for filename in os.listdir(week_folder):
-            try:
-                df = pd.read_excel(f"{week_folder}/{filename}")
-                # Извлекаем метаданные из файла
-                user_info = {
-                    'name': df['name'].iloc[0] if 'name' in df.columns else 'Неизвестно',
-                    'location': df['location'].iloc[0] if 'location' in df.columns else 'Неизвестно',
-                    'division': df['division'].iloc[0] if 'division' in df.columns else 'Неизвестно',
-                    'timestamp': df['timestamp'].iloc[0] if 'timestamp' in df.columns else datetime.now()
-                }
-                
-                # Добавляем данные в отчет
-                for _, row in df.iterrows():
-                    report_data.append({
-                        'Гос. номер': row['Гос. номер'],
-                        'Инв. №': row['Инв. №'],
-                        'Счётчик': row['Счётчик'],
-                        'Показания': row['Показания'],
-                        'Комментарий': row['Комментарий'] if 'Комментарий' in row else '',
-                        'Дата': user_info['timestamp'],
-                        'Подразделение': user_info['division'],
-                        'Локация': user_info['location'],
-                        'Отправитель': user_info['name']
-                    })
-            except Exception as e:
-                logger.error(f"Ошибка обработки файла {filename}: {e}")
-                continue
-        
-        if not report_data:
+            logger.error(f"Ошибка генерации финального отчета: {e}")
             return None
-        
-        report_df = pd.DataFrame(report_data)
-        
-        # Сохраняем в базу данных
-        self.save_to_history(report_df, week_number)
-        
-        # Генерируем Excel файл
-        output = io.BytesIO()
-        report_df.to_excel(output, index=False)
-        output.seek(0)
-        
-        return output

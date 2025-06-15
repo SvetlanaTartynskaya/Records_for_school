@@ -1,16 +1,16 @@
 import pandas as pd
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackContext, MessageHandler, Filters
+from telegram.ext import CallbackContext, MessageHandler, Filters, ConversationHandler
 import io
 import os
-from datetime import time, datetime
+from datetime import time, datetime, timedelta
 import pytz
 import sqlite3
 import logging
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 import glob
 from time_utils import RUSSIAN_TIMEZONES
-from check import MeterValidator
+from db_utils import db_transaction
 
 # Настройка логгирования
 logging.basicConfig(
@@ -108,13 +108,14 @@ def get_equipment_data() -> pd.DataFrame:
 def get_users_on_shift() -> List[Tuple[int, str, str, str]]:
     """Получаем список пользователей на вахте"""
     try:
-        cursor.execute('''
-            SELECT u.tab_number, u.name, u.location, u.division 
-            FROM Users_user_bot u
-            JOIN shifts s ON u.tab_number = s.tab_number
-            WHERE s.is_on_shift = "ДА"
-        ''')
-        return cursor.fetchall()
+        with db_transaction() as cursor:
+            cursor.execute('''
+                SELECT u.tab_number, u.name, u.location, u.division 
+                FROM Users_user_bot u
+                JOIN shifts s ON u.tab_number = s.tab_number
+                WHERE s.is_on_shift = "ДА"
+            ''')
+            return cursor.fetchall()
     except Exception as e:
         logger.error(f"Ошибка получения пользователей на вахте: {e}")
         return []
@@ -317,8 +318,30 @@ def send_reminder(context: CallbackContext):
         logger.error(f"Ошибка отправки напоминания {tab_number}: {e}")
 
 def handle_meters_file(update: Update, context: CallbackContext):
-    # При получении файла с показаниями, сохраняем с учетом часового пояса
+    """Обработка файла с показаниями счетчиков с улучшенной обработкой статуса 'Убыло'"""
     try:
+        if not update.message.document:
+            update.message.reply_text("Пожалуйста, отправьте заполненный файл Excel.")
+            return
+            
+        # Get user info from context
+        if 'tab_number' not in context.user_data:
+            update.message.reply_text("❌ Ошибка: данные пользователя не найдены. Пожалуйста, начните с /start")
+            return
+            
+        user_info = {
+            'tab_number': context.user_data['tab_number'],
+            'name': context.user_data.get('name', ''),
+            'location': context.user_data.get('location', ''),
+            'division': context.user_data.get('division', ''),
+            'chat_id': update.effective_chat.id
+        }
+        
+        # Validate that we have all required user info
+        if not all(user_info.values()):
+            update.message.reply_text("❌ Ошибка: неполные данные пользователя. Пожалуйста, начните с /start")
+            return
+        
         if not update.message.document:
             update.message.reply_text("Пожалуйста, отправьте заполненный файл Excel.")
             return
@@ -327,234 +350,194 @@ def handle_meters_file(update: Update, context: CallbackContext):
         file_id = file.file_id
         new_file = context.bot.get_file(file_id)
         
-        # Создаем папку, если не существует
-        os.makedirs('meter_readings', exist_ok=True)
+        # Проверяем формат файла
+        if not file.file_name.lower().endswith(('.xlsx', '.xls')):
+            update.message.reply_text("❌ Пожалуйста, отправьте файл в формате Excel (.xlsx, .xls)")
+            return
+            
+        # Получаем данные пользователя из context.user_data
+        if 'tab_number' not in context.user_data:
+            update.message.reply_text("❌ Ошибка: данные пользователя не найдены. Пожалуйста, начните с /start")
+            return
+            
+        tab_number = context.user_data['tab_number']
+        name = context.user_data.get('name', '')
+        location = context.user_data.get('location', '')
+        division = context.user_data.get('division', '')
         
-        # Создаем папку для отчетов текущей недели, если не существует
-        current_week = datetime.now().strftime('%Y-W%U')  # Год-Номер недели
+        if not all([tab_number, name, location, division]):
+            update.message.reply_text("❌ Ошибка: неполные данные пользователя. Пожалуйста, начните с /start")
+            return
+        
+        # Создаем папки для сохранения
+        current_week = datetime.now().strftime('%Y-W%U')
         report_folder = f'meter_readings/week_{current_week}'
         os.makedirs(report_folder, exist_ok=True)
         
-        # Получаем данные пользователя
-        tab_number = context.user_data.get('tab_number')
-        if not tab_number:
-            update.message.reply_text("Ошибка: не удалось определить ваш табельный номер. Пожалуйста, запустите /start.")
-            return
-            
-        cursor.execute('''
-            SELECT name, location, division FROM Users_user_bot WHERE tab_number = ?
-        ''', (tab_number,))
-        user_data = cursor.fetchone()
-        
-        if not user_data:
-            update.message.reply_text("Ошибка: пользователь не найден в базе данных.")
-            return
-            
-        name, location, division = user_data
-        
-        # Получаем текущее время в часовом поясе пользователя
-        local_time = get_local_datetime(location)
-        timestamp = local_time.strftime('%Y%m%d_%H%M%S')
-        
-        # Формируем имя файла с учетом часового пояса и недели
+        # Сохраняем файл
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         file_path = f'{report_folder}/meters_{location}_{division}_{tab_number}_{timestamp}.xlsx'
         new_file.download(file_path)
         
-        # Проверяем, что файл Excel
-        if not file.file_name.lower().endswith(('.xlsx', '.xls')):
-            update.message.reply_text("Пожалуйста, отправьте файл в формате Excel (.xlsx, .xls)")
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            return
-            
-        try:
-            # Открываем файл и добавляем метаданные
-            df = pd.read_excel(file_path)
-            
-            # Формируем информацию для метаданных
-            user_info = {
-                'name': name,
-                'location': location,
-                'division': division,
-                'tab_number': tab_number,
-                'timestamp': format_datetime_for_timezone(local_time, location)
-            }
-            
-            for key, value in user_info.items():
-                if key not in df.columns:
-                    df[key] = value
-            
-            # Сохраняем обновленный файл с метаданными
-            df.to_excel(file_path, index=False)
-        except Exception as e:
-            update.message.reply_text(f"Ошибка при чтении файла Excel: {str(e)}")
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            return
-        
-        # Проверяем файл с показаниями
+        # Валидация файла
+        from check import MeterValidator
         validator = MeterValidator()
-        validation_result = validator.validate_file(file_path, user_info)
+        validation_result = validator.validate_file(file_path, {
+            'name': name,
+            'location': location,
+            'division': division,
+            'tab_number': tab_number,
+            'user_data': context.user_data
+        }, context)
         
+        # Обработка результатов валидации
         if not validation_result['is_valid']:
-            # Формируем сообщение об ошибках только для пользователя
             errors_text = "\n".join(validation_result['errors'])
+            
+            # Сохраняем данные для последующего использования
+            context.user_data['validation_result'] = validation_result
+            context.user_data['file_path'] = file_path  # Сохраняем путь к файлу
+            
+            keyboard = [
+                [InlineKeyboardButton("Я не согласен с ошибками", callback_data='disagree_with_errors')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             update.message.reply_text(
-                f"❌ Обнаружены ошибки:\n\n{errors_text}\n\n"
-                "Пожалуйста, исправьте ошибки и отправьте файл повторно."
+                f"❌ Обнаружены критические ошибки:\n\n{errors_text}\n\n"
+                "Показания НЕ сохранены. Если вы не согласны с ошибками:",
+                reply_markup=reply_markup
             )
-            
-            # Удаляем временный файл
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            
             return
+
+            
+        # Если все в порядке - сохраняем и уведомляем
+        from check import MeterValidator
+        validator = MeterValidator()
         
-        # Код для успешной валидации
-        # Получаем московское время для проверки сроков
-        moscow_tz = pytz.timezone('Europe/Moscow')
-        moscow_now = datetime.now(moscow_tz)
-        moscow_time_str = moscow_now.strftime('%H:%M %d.%m.%Y')
+        # Читаем файл и сохраняем в финальный отчет
+        df = pd.read_excel(file_path)
         
-        # Проверяем, является ли день пятницей (4) и время до 14:00
-        is_on_time = moscow_now.weekday() == 4 and moscow_now.hour < 14
+        # Добавляем метаданные
+        df['name'] = name
+        df['location'] = location
+        df['division'] = division
+        df['tab_number'] = tab_number
+        df['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        # Отправляем подтверждение пользователю
+        # Сохраняем в финальный отчет
+        save_result = validator.save_to_final_report(df)
+        
+        if save_result.get('status') != 'success':
+            error_msg = save_result.get('message', 'Неизвестная ошибка')
+            update.message.reply_text(f"❌ Ошибка при сохранении показаний: {error_msg}")
+            return
+            
+        # Проверяем сроки сдачи
+        is_on_time = check_if_on_time()
+        message = (
+            f"✅ Спасибо! Ваши показания счетчиков приняты и прошли проверку.\n\n"
+            f"📍 Локация: {location}\n"
+            f"🏢 Подразделение: {division}\n"
+        )
+        
         if is_on_time:
-            message_text = (f"✅ Спасибо! Ваши показания счетчиков приняты и прошли проверку.\n\n"
-                           f"📍 Локация: {location}\n"
-                           f"🏢 Подразделение: {division}\n"
-                           f"⏰ Время получения: {moscow_time_str} МСК\n\n"
-                           f"Показания предоставлены в срок. Благодарим за своевременную подачу данных!")
-        else:
-            message_text = (f"✅ Спасибо! Ваши показания счетчиков приняты и прошли проверку.\n\n"
-                           f"📍 Локация: {location}\n"
-                           f"🏢 Подразделение: {division}\n"
-                           f"⏰ Время получения: {moscow_time_str} МСК")
+            message += "Показания предоставлены в срок. Благодарим за своевременную подачу данных!"
         
-        update.message.reply_text(message_text)
+        update.message.reply_text(message)
         
-        # Если есть предупреждения, сообщаем о них
-        if validation_result['warnings']:
+        if validation_result.get('warnings'):
             warnings_text = "\n".join(validation_result['warnings'])
-            update.message.reply_text(f"⚠️ Предупреждения при проверке:\n\n{warnings_text}")
+            update.message.reply_text(f"⚠️ Предупреждения:\n{warnings_text}")
         
-        # Удаляем пользователя из списка тех, кому отправлено напоминание
+        # Удаляем из списка неотправивших
         if 'missing_reports' in context.bot_data and tab_number in context.bot_data['missing_reports']:
             del context.bot_data['missing_reports'][tab_number]
-            logger.info(f"Пользователь {name} удален из списка неотправивших отчеты")
-        
-        # Создаем сводный отчет
-        report_generator = context.bot_data.get('report_generator')
-        if not report_generator:
-            from check import FinalReportGenerator
-            report_generator = FinalReportGenerator(context.bot)
-            context.bot_data['report_generator'] = report_generator
-        
-        # Добавляем отчет в сводный
-        cycle_id = report_generator.init_new_report_cycle()
-        if cycle_id:
-            report_path = report_generator.add_user_report(file_path, user_info)
-            
-            if report_path:
-                # Отправляем подтверждение пользователю
-                update.message.reply_text("✅ Ваши показания приняты и добавлены в сводный отчет")
-        
-        # Уведомляем администраторов и руководителей
-        notify_admins_and_managers(context, tab_number, name, location, division, file_path)
             
     except Exception as e:
         logger.error(f"Ошибка обработки файла показаний: {e}")
-        update.message.reply_text(f"❌ Произошла ошибка при обработке файла: {str(e)}")
+        update.message.reply_text("❌ Произошла ошибка при обработке файла. Пожалуйста, попробуйте позже.")
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
 
-def notify_admins_and_managers(context: CallbackContext, user_tab_number: int, user_name: str, 
-                             location: str, division: str, file_path: str):
-    """Уведомление администраторов и руководителей о новых показаниях"""
+def handle_disagree_with_errors(update: Update, context: CallbackContext):
+    """Обработка нажатия кнопки 'Я не согласен с ошибками'"""
+    query = update.callback_query
+    query.answer()
+    
+    # Получаем данные из контекста
+    validation_result = context.user_data.get('validation_result')
+    file_path = context.user_data.get('file_path')
+    user_info = {
+        'tab_number': context.user_data['tab_number'],
+        'name': context.user_data['name'],
+        'location': context.user_data['location'],
+        'division': context.user_data['division'],
+        'chat_id': update.effective_chat.id
+    }
+    
+    if not validation_result or not file_path:
+        query.edit_message_text("❌ Ошибка: данные для обработки не найдены.")
+        return
+        
+    # Уведомляем администраторов
+    notify_admin_about_disagreement(
+        context, 
+        user_info, 
+        file_path, 
+        validation_result['errors']
+    )
+    
+    query.edit_message_text(
+        "✅ Ваше несогласие с ошибками отправлено администратору. "
+        "Ожидайте решения или свяжитесь с администратором."
+    )
+    
+    return ConversationHandler.END
+
+def check_if_on_time():
+    """Проверяет, сданы ли показания в срок (до пятницы 14:00 по МСК)"""
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    now = datetime.now(moscow_tz)
+    return now.weekday() < 5 or (now.weekday() == 4 and now.hour < 14)
+
+def notify_admins_about_ubylo(context, request_data):
+    """Уведомление администраторов о запросе 'Убыло'"""
     try:
-        # Убеждаемся, что папка meter_readings существует
-        os.makedirs('meter_readings', exist_ok=True)
+        from check import MeterValidator
+        validator = MeterValidator()
+        admins = validator.get_admin_for_division(request_data['division'])
         
-        # Загружаем данные отчета
-        report_df = pd.read_excel(file_path)
+        if not admins:
+            # Если нет администраторов для подразделения, берем всех
+            cursor.execute('SELECT tab_number, name FROM Users_admin_bot')
+            admins = cursor.fetchall()
         
-        # Получаем список всех администраторов
-        cursor.execute('SELECT tab_number, name FROM Users_admin_bot')
-        admins = cursor.fetchall()
-        
-        # Получаем список всех руководителей
-        cursor.execute('SELECT tab_number, name FROM Users_dir_bot')
-        managers = cursor.fetchall()
-        
-        # Получаем текущее время в часовом поясе локации
-        local_time = get_local_datetime(location)
-        formatted_time = format_datetime_for_timezone(local_time, location)
-        
-        # Сообщение
-        message = f"📊 *Получены новые показания счетчиков*\n\n" \
-                  f"👤 От: {user_name}\n" \
-                  f"📍 Локация: {location}\n" \
-                  f"🏢 Подразделение: {division}\n" \
-                  f"⏰ Время: {formatted_time}"
-                  
-        # Для администраторов, получаем генератор отчетов из контекста
-        report_generator = context.bot_data.get('report_generator')
-        if not report_generator:
-            from check import FinalReportGenerator
-            report_generator = FinalReportGenerator(context.bot)
-            context.bot_data['report_generator'] = report_generator
+        for admin_id, admin_name in admins:
+            keyboard = [
+                [InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_ubylo_{request_data['request_id']}")],
+                [InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_ubylo_{request_data['request_id']}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             
-        # Инициализируем новый цикл, если еще не инициализирован
-        cycle_id = report_generator.init_new_report_cycle()
-        
-        # Проверяем, что цикл создан успешно
-        if not cycle_id:
-            logger.error("Не удалось инициализировать цикл отчётности")
-            Update.message.reply_text("❌ Ошибка при создании цикла отчётности. Пожалуйста, свяжитесь с администратором.")
-            return
-            
-        # Добавляем отчет пользователя
-        user_info = {
-            'name': user_name, 
-            'location': location, 
-            'division': division, 
-            'tab_number': user_tab_number
-        }
-        report_path = report_generator.add_user_report(file_path, user_info)
-        
-        # Проверяем, что отчет добавлен успешно
-        if not report_path:
-            logger.error("Не удалось добавить отчет пользователя в цикл")
-            return
-            
-        # Отправляем запрос на подтверждение администраторам
-        report_generator.send_verification_request(context, report_path)
-        
-        # Уведомляем руководителей (без кнопки подтверждения)
-        for manager_id, manager_name in managers:
             try:
-                # Отправляем уведомление
                 context.bot.send_message(
-                    chat_id=manager_id,
-                    text=f"{message}\n\nОтчёт прикреплен ниже.",
-                    parse_mode='Markdown'
+                    chat_id=admin_id,
+                    text=f"⚠️ Запрос на отметку 'Убыло'\n\n"
+                         f"Инв. №: {request_data['inv_num']}\n"
+                         f"Счётчик: {request_data['meter_type']}\n"
+                         f"Пользователь: {request_data['user_name']}\n"
+                         f"Локация: {request_data['location']}\n"
+                         f"Подразделение: {request_data['division']}\n\n"
+                         f"Пожалуйста, подтвердите или отклоните запрос:",
+                    reply_markup=reply_markup
                 )
-                
-                # Проверяем существование файла перед отправкой
-                if os.path.exists(file_path):
-                    # Отправляем файл
-                    with open(file_path, 'rb') as f:
-                        context.bot.send_document(
-                            chat_id=manager_id,
-                            document=f,
-                            caption=f"Показания счетчиков от {user_name}"
-                        )
-                else:
-                    logger.error(f"Файл не найден при отправке руководителю: {file_path}")
+                logger.info(f"Уведомление отправлено администратору {admin_name}")
             except Exception as e:
-                logger.error(f"Ошибка уведомления руководителя {manager_id}: {e}")
-                
+                logger.error(f"Ошибка отправки уведомления администратору {admin_name}: {e}")
     except Exception as e:
-        logger.error(f"Ошибка уведомления о новых показаниях: {e}")
+        logger.error(f"Ошибка уведомления администраторов: {e}")
+
 
 def notify_admin_about_errors(context: CallbackContext, user_tab_number: int, user_name: str,
                              location: str, division: str, file_path: str, errors: list):
@@ -704,6 +687,267 @@ def notify_admins_about_missing_reports(context: CallbackContext):
     except Exception as e:
         logger.error(f"Ошибка уведомления администраторов: {e}")
 
+
+def notify_admin_about_disagreement(context: CallbackContext, user_info: dict, file_path: str, errors: list):
+    """Уведомление администратора о несогласии пользователя с ошибками"""
+    try:
+        from check import MeterValidator
+        validator = MeterValidator()
+        
+        admins = validator._get_admins_for_division(user_info.get('division', ''))
+        
+        if not admins:
+            logger.error(f"Не найдены администраторы для подразделения {user_info.get('division', '')}")
+            return
+            
+        errors_text = "\n".join(errors)
+        
+        for admin_tab, admin_name, admin_chat_id in admins:
+            try:
+                if not admin_chat_id:
+                    logger.warning(f"Администратор {admin_name} не имеет chat_id")
+                    continue
+                
+                # Формируем уникальный идентификатор запроса
+                request_id = f"disagree_{datetime.now().timestamp()}"
+                
+                keyboard = [
+                    [InlineKeyboardButton("Отправить показания за пользователя", 
+                                       callback_data=f"admin_submit_{user_info['tab_number']}")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                context.bot.send_message(
+                    chat_id=admin_chat_id,
+                    text=f"⚠️ Пользователь не согласен с ошибками\n\n"
+                         f"👤 Пользователь: {user_info['name']}\n"
+                         f"📍 Локация: {user_info['location']}\n"
+                         f"🏢 Подразделение: {user_info['division']}\n\n"
+                         f"Обнаруженные ошибки:\n{errors_text}\n\n"
+                         f"Вы можете отправить показания за пользователя:",
+                    reply_markup=reply_markup
+                )
+                
+                if os.path.exists(file_path):
+                    with open(file_path, 'rb') as f:
+                        context.bot.send_document(
+                            chat_id=admin_chat_id,
+                            document=f,
+                            caption=f"Файл с показаниями от {user_info['name']}"
+                        )
+                else:
+                    logger.error(f"Файл не найден: {file_path}")
+                    context.bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=f"⚠️ Файл с показаниями не найден или был удалён."
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Ошибка уведомления администратора {admin_name}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка уведомления администратора о несогласии: {e}")
+
+
+def handle_admin_submit_readings(update: Update, context: CallbackContext):
+    """Обработка отправки показаний администратором за пользователя"""
+    query = update.callback_query
+    query.answer()
+    
+    user_tab = int(query.data.split('_')[2])
+    
+    cursor.execute('''
+        SELECT name, location, division FROM Users_user_bot WHERE tab_number = ?
+    ''', (user_tab,))
+    user_data = cursor.fetchone()
+    
+    if not user_data:
+        query.edit_message_text("Пользователь не найден.")
+        return
+        
+    name, location, division = user_data
+    
+    # Сохраняем данные в контексте
+    context.user_data['admin_submit'] = True
+    context.user_data['user_tab'] = user_tab
+    context.user_data['user_name'] = name
+    context.user_data['location'] = location
+    context.user_data['division'] = division
+    
+    # Получаем список оборудования для этой локации и подразделения
+    from check import MeterValidator
+    validator = MeterValidator()
+    equipment = validator._get_equipment_for_location_division(location, division)
+    
+    if equipment.empty:
+        query.edit_message_text(f"Для локации {location} и подразделения {division} нет оборудования.")
+        return
+        
+    # Сохраняем оборудование в контексте
+    context.user_data['equipment'] = equipment.to_dict('records')
+    context.user_data['current_index'] = 0
+    
+    # Начинаем ввод показаний
+    from main import show_next_equipment
+    return show_next_equipment(update, context)
+
+
+# В meters_handler.py добавим новую функцию
+def handle_admin_view_week(update: Update, context: CallbackContext):
+    """Просмотр показаний за неделю администратором"""
+    from main import check_access
+    if not check_access(update, context):
+        return
+        
+    role = context.user_data.get('role')
+    if role not in ['Администратор', 'Руководитель']:
+        update.message.reply_text("Эта команда доступна только администраторам и руководителям.")
+        return
+        
+    # Get current week
+    current_week = datetime.now().strftime('%Y-W%U')
+    report_folder = f'meter_readings/week_{current_week}'
+    
+    if not os.path.exists(report_folder):
+        update.message.reply_text("За эту неделю еще нет показаний.")
+        return
+        
+    # Get user info
+    tab_number = context.user_data.get('tab_number')
+    cursor.execute('''
+        SELECT location, division FROM Users_admin_bot WHERE tab_number = ?
+        UNION
+        SELECT location, division FROM Users_dir_bot WHERE tab_number = ?
+    ''', (tab_number, tab_number))
+    user_info = cursor.fetchone()
+    
+    if not user_info:
+        update.message.reply_text("Ошибка: пользователь не найден.")
+        return
+        
+    location, division = user_info
+    
+    # Get all reports for the location/division
+    reports = []
+    for filename in os.listdir(report_folder):
+        if f"_{location}_{division}_" in filename:
+            reports.append(os.path.join(report_folder, filename))
+    
+    if not reports:
+        update.message.reply_text("Нет доступных показаний для просмотра.")
+        return
+        
+    # Create combined report
+    all_data = []
+    for report in reports:
+        try:
+            df = pd.read_excel(report)
+            all_data.append(df)
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла {report}: {e}")
+    
+    if not all_data:
+        update.message.reply_text("Ошибка при формировании отчета.")
+        return
+        
+    combined_df = pd.concat(all_data)
+    
+    # Save to temp file
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        combined_df.to_excel(writer, index=False)
+    output.seek(0)
+    
+    update.message.reply_document(
+        document=InputFile(output, filename=f'Показания_{location}_{division}_{current_week}.xlsx'),
+        caption=f"Сводные показания за неделю {current_week}"
+    )
+
+def notify_managers_about_unresolved_disagreements(context: CallbackContext):
+    """Уведомление руководителей о нерешенных несогласиях в понедельник 8:00"""
+    try:
+        logger.info("Проверка нерешенных несогласий и уведомление руководителей")
+        
+        # Получаем все нерешенные запросы (старше 3 дней)
+        three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        cursor.execute('''
+            SELECT * FROM pending_requests 
+            WHERE status = 'pending' AND timestamp < ?
+        ''', (three_days_ago,))
+        
+        unresolved_requests = cursor.fetchall()
+        
+        if not unresolved_requests:
+            logger.info("Нет нерешенных запросов")
+            return
+            
+        # Для каждого запроса находим руководителей подразделения
+        for request in unresolved_requests:
+            request_id, inv_num, meter_type, user_tab, user_name, location, division, status, _, _, timestamp = request
+            
+            # Получаем список руководителей для этого подразделения
+            cursor.execute('''
+                SELECT tab_number, name, chat_id FROM Users_dir_bot 
+                WHERE division = ? AND chat_id IS NOT NULL
+            ''', (division,))
+            
+            managers = cursor.fetchall()
+            
+            if not managers:
+                logger.warning(f"Не найдены руководители для подразделения {division}")
+                continue
+                
+            # Получаем файл с оригинальными показаниями пользователя
+            original_file_pattern = f'meter_readings/*/*_{location}_{division}_{user_tab}_*.xlsx'
+            original_files = glob.glob(original_file_pattern)
+            
+            if not original_files:
+                logger.warning(f"Не найден оригинальный файл показаний для {user_name}")
+                continue
+                
+            original_file = sorted(original_files, reverse=True)[0]  # Берем самый свежий файл
+            
+            # Отправляем уведомление каждому руководителю
+            for manager_tab, manager_name, manager_chat_id in managers:
+                try:
+                    # Создаем клавиатуру с действиями
+                    keyboard = [
+                        [InlineKeyboardButton("Отправить показания за пользователя", 
+                                           callback_data=f"manager_submit_{user_tab}")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    # Отправляем сообщение
+                    context.bot.send_message(
+                        chat_id=manager_chat_id,
+                        text=f"⚠️ *Требуется ваше вмешательство*\n\n"
+                             f"Пользователь {user_name} не согласен с ошибками в показаниях,\n"
+                             f"и администратор не ответил на запрос.\n\n"
+                             f"📍 Локация: {location}\n"
+                             f"🏢 Подразделение: {division}\n\n"
+                             f"Пожалуйста, отправьте показания за пользователя:",
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                    
+                    # Отправляем оригинальный файл пользователя
+                    with open(original_file, 'rb') as f:
+                        context.bot.send_document(
+                            chat_id=manager_chat_id,
+                            document=InputFile(f, filename=f'Показания_{user_name}.xlsx'),
+                            caption=f"Оригинальные показания от {user_name}"
+                        )
+                    
+                    logger.info(f"Уведомление отправлено руководителю {manager_name}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления руководителя {manager_name}: {e}")
+                    
+    except Exception as e:
+        logger.error(f"Ошибка уведомления руководителей: {e}")
+
+
 def notify_managers_about_missing_reports(context: CallbackContext):
     """Уведомление руководителей в понедельник в 08:00"""
     try:
@@ -780,12 +1024,12 @@ def setup_meters_handlers(dispatcher):
     try:
         # Планируем еженедельные напоминания при старте бота
         # Добавляем небольшую задержку для полной инициализации системы
-        dispatcher.job_queue.run_once(
-            callback=schedule_weekly_reminders,
-            when=10,  # Задержка в 10 секунд для гарантированной инициализации
-            name="init_weekly_schedule",
-            job_kwargs={'misfire_grace_time': 60}  # Допустимая задержка выполнения в секундах
-        )
+        # dispatcher.job_queue.run_once(
+        #     callback=schedule_weekly_reminders,
+        #     when=10,  # Задержка в 10 секунд для гарантированной инициализации
+        #     name="init_weekly_schedule",
+        #     job_kwargs={'misfire_grace_time': 60}  # Допустимая задержка выполнения в секундах
+        # )
         
         # Регистрация обработчика файлов с показаниями
         dispatcher.add_handler(
