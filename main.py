@@ -5,7 +5,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Conve
 from telegram.error import NetworkError
 import sqlite3
 import pytz
-from datetime import time, datetime
+from datetime import time, datetime, timedelta
 from shifts_handler import ShiftsHandler
 import os
 import logging
@@ -28,6 +28,22 @@ ENTER_TAB_NUMBER, ENTER_READINGS, WAITING_FOR_ADMIN_CHOICE, WAIT_MANAGER_EXCEL, 
 
 # Инициализация обработчика табеля
 shifts_handler = ShiftsHandler()
+
+def update_data_from_1c():
+    try:
+        # 1. Загрузка пользователей
+        users_df = pd.read_excel(r'C:\bot_data\Users.xlsx')
+        
+        # 2. Загрузка смен
+        shifts_df = pd.read_excel(r'C:\bot_data\tabels.xlsx')
+        
+        # 3. Загрузка оборудования
+        equipment_df = pd.read_excel(r'C:\bot_data\Equipment.xlsx')
+        
+        logger.info("Данные из 1С успешно обновлены")
+    except Exception as e:
+        logger.error(f"Ошибка обновления данных: {e}")
+
 
 # Загрузка таблицы пользователей
 def load_users_table():
@@ -1779,18 +1795,20 @@ def handle_view_readings(update: Update, context: CallbackContext):
         caption=f"Показания за неделю {current_week} (локация: {location}, подразделение: {division})"
     )
 
-
 def get_available_users_by_role(role):
     """Получает список доступных пользователей по роли"""
-    with sqlite3.cursorect('Users_bot.db') as cursor:
-        
-        if role == 'Администратор':
-            cursor.execute('SELECT name, chat_id FROM Users_admin_bot')
-        elif role == 'Руководитель':
-            cursor.execute('SELECT name, chat_id FROM Users_dir_bot')
-        else:
-            cursor.execute('SELECT name, chat_id FROM Users_user_bot')
-        return cursor.fetchall()
+    try:
+        with db_transaction() as cursor:
+            if role == 'Администратор':
+                cursor.execute('SELECT name, chat_id FROM Users_admin_bot')
+            elif role == 'Руководитель':
+                cursor.execute('SELECT name, chat_id FROM Users_dir_bot')
+            else:
+                cursor.execute('SELECT name, chat_id FROM Users_user_bot')
+            return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка получения пользователей по роли {role}: {e}")
+        return []
 
 def handle_disagree_with_errors(update: Update, context: CallbackContext):
     """Обработка нажатия кнопки 'Я не согласен с ошибками'"""
@@ -2418,20 +2436,47 @@ def handle_view_week_report(update: Update, context: CallbackContext):
         return
         
     try:
-        # Получаем данные из final_report
+        # Получаем данные пользователя
+        tab_number = context.user_data.get('tab_number')
+        
+        # Получаем информацию о подразделении администратора/руководителя
+        with db_transaction() as cursor:
+            if role == 'Администратор':
+                cursor.execute('''
+                    SELECT location, division FROM Users_admin_bot WHERE tab_number = ?
+                ''', (tab_number,))
+            else:  # Руководитель
+                cursor.execute('''
+                    SELECT location, division FROM Users_dir_bot WHERE tab_number = ?
+                ''', (tab_number,))
+            
+            user_info = cursor.fetchone()
+        
+        if not user_info:
+            update.message.reply_text("Ошибка: пользователь не найден.")
+            return
+            
+        location, division = user_info
+        
+        # Получаем данные из final_report для этой локации и подразделения
         with db_transaction() as cursor:
             cursor.execute('''
                 SELECT 
                     gov_number, inv_number, meter_type, reading, comment,
                     name, date, division, location, sender
                 FROM final_report
-                WHERE date >= date('now', 'weekday 0', '-5 days')
+                WHERE location = ? AND division = ?
                 ORDER BY date DESC
-            ''')
+            ''', (location, division))
+            
             report_data = cursor.fetchall()
             
         if not report_data:
-            update.message.reply_text("За эту неделю нет данных в отчете.")
+            update.message.reply_text(
+                f"За эту неделю нет данных в отчете для:\n"
+                f"📍 Локация: {location}\n"
+                f"🏢 Подразделение: {division}"
+            )
             return
             
         # Создаем DataFrame
@@ -2449,12 +2494,14 @@ def handle_view_week_report(update: Update, context: CallbackContext):
         
         # Формируем имя файла
         current_week = datetime.now().strftime('%Y-W%U')
-        filename = f'final_report_{current_week}.xlsx'
+        filename = f'final_report_{location}_{division}_{current_week}.xlsx'
         
         # Отправляем пользователю
         update.message.reply_document(
             document=InputFile(output, filename=filename),
-            caption=f"Финальный отчет за неделю {current_week}"
+            caption=f"Финальный отчет за неделю {current_week}\n"
+                   f"📍 Локация: {location}\n"
+                   f"🏢 Подразделение: {division}"
         )
         
     except Exception as e:

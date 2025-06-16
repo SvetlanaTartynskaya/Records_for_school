@@ -18,8 +18,6 @@ class MeterValidator:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.cursor = self.conn.cursor()
         self.load_equipment()
-        self.cursor = self.conn.cursor()
-        self.load_equipment()
 
     def load_equipment(self):
         """Загрузка справочника оборудования"""
@@ -74,15 +72,16 @@ class MeterValidator:
     def _get_last_reading(self, inv_num, meter_type):
         """Получение последнего показания для данного счетчика из final_report"""
         try:
-            self.cursor.execute('''
-                SELECT reading, date
-                FROM final_report
-                WHERE inv_number = ? AND meter_type = ?
-                ORDER BY date DESC
-                LIMIT 1
-            ''', (inv_num, meter_type))
+            with db_transaction() as cursor:
+                self.cursor.execute('''
+                    SELECT reading, date
+                    FROM final_report
+                    WHERE inv_number = ? AND meter_type = ?
+                    ORDER BY date DESC
+                    LIMIT 1
+                ''', (inv_num, meter_type))
             
-            result = self.cursor.fetchone()
+                result = self.cursor.fetchone()
             if result:
                 return {
                     'reading': float(result[0]) if result[0] is not None else None,
@@ -118,13 +117,14 @@ class MeterValidator:
     def _has_pending_ubylo(self, inv_num: str, meter_type: str) -> bool:
         """Проверяет наличие активного запроса 'Убыло' для оборудования"""
         try:
-            self.cursor.execute('''
-                SELECT 1 FROM pending_requests 
-                WHERE inv_num = ? AND meter_type = ? 
-                AND status = 'pending'
-                AND timestamp > datetime('now', '-5 days')
-            ''', (inv_num, meter_type))
-            return self.cursor.fetchone() is not None
+            with db_transaction() as cursor:
+                self.cursor.execute('''
+                    SELECT 1 FROM pending_requests 
+                    WHERE inv_num = ? AND meter_type = ? 
+                    AND status = 'pending'
+                    AND timestamp > datetime('now', '-5 days')
+                ''', (inv_num, meter_type))
+                return self.cursor.fetchone() is not None
         except Exception as e:
             logger.error(f"Ошибка проверки pending-статуса: {e}")
             return False
@@ -138,9 +138,10 @@ class MeterValidator:
             user_chat_id = user_info.get('chat_id')
             
             if not user_chat_id:
-                self.cursor.execute('SELECT chat_id FROM Users_user_bot WHERE tab_number = ?', (user_info['tab_number'],))
-                result = self.cursor.fetchone()
-                user_chat_id = result[0] if result else None
+                with db_transaction() as cursor:
+                    self.cursor.execute('SELECT chat_id FROM Users_user_bot WHERE tab_number = ?', (user_info['tab_number'],))
+                    result = self.cursor.fetchone()
+                    user_chat_id = result[0] if result else None
             
             if not user_chat_id:
                 logger.error(f"Не удалось определить chat_id пользователя {user_info['tab_number']}")
@@ -268,15 +269,16 @@ class MeterValidator:
                         warnings.append(f"Строка {idx + 1}: Показания игнорированы для оборудования с статусом 'Убыло'")
                     
                     # Проверяем статус подтверждения
-                    self.cursor.execute('''
-                        SELECT status FROM pending_requests 
-                        WHERE inv_num = ? AND meter_type = ?
-                        AND timestamp > datetime('now', '-5 days')
-                        ORDER BY timestamp DESC
-                        LIMIT 1
-                    ''', (row['Инв. №'], row['Счётчик']))
-                    
-                    result = self.cursor.fetchone()
+                    with db_transaction() as cursor:
+                        self.cursor.execute('''
+                            SELECT status FROM pending_requests 
+                            WHERE inv_num = ? AND meter_type = ?
+                            AND timestamp > datetime('now', '-5 days')
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        ''', (row['Инв. №'], row['Счётчик']))
+                        
+                        result = self.cursor.fetchone()
                     
                     if result:
                         status = result[0]
@@ -366,27 +368,28 @@ class MeterValidator:
     def get_admin_for_division(self, division):
         """Получение ID администратора для данного подразделения"""
         try:
-            # Проверяем наличие подразделения
-            if not division:
-                return []
-                
-            self.cursor.execute('''
-                SELECT tab_number, name
-                FROM Users_admin_bot
-                WHERE division = ?
-            ''', (division,))
-            
-            admins = self.cursor.fetchall()
-            
-            # Если нет администраторов для подразделения, вернем всех администраторов
-            if not admins:
+            with db_transaction() as cursor:
+                # Проверяем наличие подразделения
+                if not division:
+                    return []
+                    
                 self.cursor.execute('''
                     SELECT tab_number, name
                     FROM Users_admin_bot
-                ''')
+                    WHERE division = ?
+                ''', (division,))
+                
                 admins = self.cursor.fetchall()
                 
-            return admins
+                # Если нет администраторов для подразделения, вернем всех администраторов
+                if not admins:
+                    self.cursor.execute('''
+                        SELECT tab_number, name
+                        FROM Users_admin_bot
+                    ''')
+                    admins = self.cursor.fetchall()
+                    
+                return admins
         except Exception as e:
             logger.error(f"Ошибка получения администратора для подразделения: {e}")
             return []
